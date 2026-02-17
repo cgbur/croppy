@@ -1,0 +1,18 @@
+[package]
+name = "croppy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.97"
+clap = { version = "4.5.32", features = ["derive"] }
+opencv = { version = "0.98.1", default-features = false, features = [
+    "clang-runtime",
+    "imgproc",
+    "imgcodecs",
+] }
+rawloader = "0.37.1"
+rusqlite = { version = "0.38.0", features = ["bundled"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+walkdir = "2.5.0"
