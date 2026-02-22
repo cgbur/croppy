@@ -4,15 +4,16 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-anyhow = "1.0.97"
-clap = { version = "4.5.32", features = ["derive"] }
-opencv = { version = "0.98.1", default-features = false, features = [
-    "clang-runtime",
-    "imgproc",
-    "imgcodecs",
-] }
-rawloader = "0.37.1"
-rusqlite = { version = "0.38.0", features = ["bundled"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.29.0"
+image = "0.25.6"
+imageproc = "0.25.0"
+memmap2 = "0.9.5"
+rand = "0.9.0"
+ratatui = "0.29.0"
+rayon = "1.10.0"
+rsraw = "0.1.0"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 walkdir = "2.5.0"
