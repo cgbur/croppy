@@ -33,7 +33,7 @@ Build failed because toolchain/runtime deps are missing in this session:
 
 ## Next steps for next session
 
-1. Enter a nix shell/devshell with toolchain + system deps (`rustc/cargo`, `clang` or `gcc`, OpenCV, SQLite).
+1. Use your normal shell with a standard Rust toolchain available (`rustup`, `cargo`, C toolchain).
 2. Run:
    - `cargo +nightly fmt`
    - `cargo check`
