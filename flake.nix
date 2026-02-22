@@ -18,7 +18,6 @@
           pkg-config
           clang
           llvmPackages.libclang
-          opencv
           sqlite
         ];
 

@@ -1,510 +1,1181 @@
-use std::collections::HashSet;
-use std::fs;
+use std::collections::VecDeque;
+use std::io::{self, Stdout};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use std::{fs, thread};
 
-use anyhow::{Context, Result, anyhow};
-use clap::{Parser, Subcommand};
-use opencv::core::{self, Mat, Point, Point2f, Scalar, Size, Vector};
-use opencv::prelude::*;
-use opencv::{imgcodecs, imgproc};
-use rawloader::RawImageData;
-use rusqlite::Connection;
-use serde::Serialize;
-use walkdir::WalkDir;
+use anyhow::{Result, anyhow};
+use clap::Parser;
+use croppy::detect::{BoundsNorm, DetectConfig};
+use croppy::detect_refine::{
+    RotationRefineConfig, draw_norm_rect, draw_refined_inner_backproject,
+    run_detection_with_rotation_refine,
+};
+use croppy::discover::{is_supported_raw, list_raw_files};
+use croppy::preprocess::{PreprocessConfig, prepare_image, resize_rgb_max_edge};
+use croppy::raw::{decode_raw_bytes_to_rgb, rgb_to_gray};
+use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, BorderType, Borders, Gauge, List, ListItem, Paragraph};
 
 #[derive(Parser, Debug)]
-#[command(name = "croppy")]
-#[command(about = "Detect crop/rotation candidates for scanned film RAW files")]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
-}
-
-#[derive(Subcommand, Debug)]
-enum Commands {
-    Detect(DetectArgs),
-}
-
-#[derive(Parser, Debug)]
-struct DetectArgs {
-    /// Folder containing RAW files.
+#[command(about = "Croppy TUI batch runner")]
+struct Args {
+    #[arg(default_value = ".")]
     input: PathBuf,
 
-    /// Include subdirectories.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = true)]
     recursive: bool,
 
-    /// Optional Lightroom catalog (.lrcat) for skip filtering.
-    #[arg(long)]
-    lrcat: Option<PathBuf>,
+    #[arg(long, default_value_t = 1000)]
+    max_edge: u32,
 
-    /// Include files with existing edits (XMP sidecar or crop keys in catalog).
-    #[arg(long, default_value_t = false)]
-    include_modified: bool,
-
-    /// Limit number of files processed after filtering.
-    #[arg(long)]
-    max_files: Option<usize>,
-
-    /// Max preview dimension (long edge).
-    #[arg(long, default_value_t = 2400)]
-    downscale_max: i32,
-
-    /// Directory for overlay previews. If omitted, previews are not written.
-    #[arg(long)]
-    preview_dir: Option<PathBuf>,
-
-    /// Output JSON report path.
-    #[arg(long, default_value = "croppy-detect-report.json")]
-    out: PathBuf,
+    #[arg(long, default_value = ".")]
+    out_dir: PathBuf,
 }
 
-#[derive(Debug, Serialize)]
-struct DetectReport {
-    schema_version: String,
-    source_path: String,
-    total_files_seen: usize,
-    total_processed: usize,
-    total_skipped: usize,
-    items: Vec<DetectItem>,
+#[derive(Clone)]
+struct RunOptions {
+    write_xmp: bool,
+    write_preview: bool,
+    max_edge: u32,
+    out_dir: PathBuf,
 }
 
-#[derive(Debug, Serialize)]
-struct DetectItem {
-    file: String,
-    path: String,
-    status: String,
-    skip_reason: Option<String>,
-    detection: Option<CropCandidate>,
+#[derive(Clone)]
+struct FileResult {
+    preview: Option<PathBuf>,
+    xmp: Option<PathBuf>,
     error: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-struct CropCandidate {
-    crop_left: f32,
-    crop_top: f32,
-    crop_right: f32,
-    crop_bottom: f32,
-    crop_angle: f32,
-    confidence: f32,
+struct RawBytesJob {
+    raw: PathBuf,
+    bytes: Vec<u8>,
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
-    match cli.command {
-        Commands::Detect(args) => run_detect(args),
-    }
+struct PipelineStats {
+    buffered_count: AtomicUsize,
+    buffered_peak: AtomicUsize,
+    buffered_capacity: usize,
 }
 
-fn run_detect(args: DetectArgs) -> Result<()> {
-    if !args.input.exists() {
-        return Err(anyhow!(
-            "Input path does not exist: {}",
-            args.input.display()
-        ));
-    }
-    if let Some(dir) = &args.preview_dir {
-        fs::create_dir_all(dir)
-            .with_context(|| format!("Failed creating preview dir: {}", dir.display()))?;
+impl PipelineStats {
+    fn new(buffered_capacity: usize) -> Self {
+        Self {
+            buffered_count: AtomicUsize::new(0),
+            buffered_peak: AtomicUsize::new(0),
+            buffered_capacity,
+        }
     }
 
-    let raw_files = discover_raw_files(&args.input, args.recursive)?;
-    let lrcat_edited = if args.include_modified {
-        HashSet::new()
-    } else if let Some(catalog) = &args.lrcat {
-        load_catalog_cropped_paths(catalog)?
-    } else {
-        HashSet::new()
-    };
+    fn inc_buffered(&self) {
+        let next = self.buffered_count.fetch_add(1, Ordering::Relaxed) + 1;
+        self.buffered_peak.fetch_max(next, Ordering::Relaxed);
+    }
 
-    let mut items = Vec::new();
-    let mut processed = 0usize;
-    let mut skipped = 0usize;
-
-    for raw_path in raw_files {
-        if let Some(max) = args.max_files {
-            if processed >= max {
+    fn dec_buffered(&self) {
+        loop {
+            let cur = self.buffered_count.load(Ordering::Relaxed);
+            if cur == 0 {
+                break;
+            }
+            if self
+                .buffered_count
+                .compare_exchange(cur, cur - 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
                 break;
             }
         }
+    }
+}
 
-        let file_name = raw_path
-            .file_name()
-            .and_then(|f| f.to_str())
-            .unwrap_or("<unknown>")
-            .to_string();
-        let path_str = raw_path.to_string_lossy().to_string();
+enum WorkerMsg {
+    Started(String),
+    Finished(FileResult),
+    Done,
+}
 
-        if !args.include_modified {
-            if has_xmp_sidecar(&raw_path) {
-                skipped += 1;
-                items.push(DetectItem {
-                    file: file_name,
-                    path: path_str,
-                    status: "skipped".to_string(),
-                    skip_reason: Some("existing_xmp_sidecar".to_string()),
-                    detection: None,
-                    error: None,
-                });
-                continue;
-            }
-            if !lrcat_edited.is_empty() && lrcat_edited.contains(&normalize_path_key(&raw_path)) {
-                skipped += 1;
-                items.push(DetectItem {
-                    file: file_name,
-                    path: path_str,
-                    status: "skipped".to_string(),
-                    skip_reason: Some("existing_catalog_crop".to_string()),
-                    detection: None,
-                    error: None,
-                });
-                continue;
-            }
-        }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Screen {
+    Select,
+    Running,
+    Done,
+}
 
-        match process_one_raw(&raw_path, args.downscale_max) {
-            Ok((candidate, preview_mat)) => {
-                processed += 1;
-                if let Some(dir) = &args.preview_dir {
-                    let mut preview_path = dir.join(
-                        raw_path
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("preview"),
-                    );
-                    preview_path.set_extension("jpg");
-                    write_preview(&preview_path, &preview_mat)?;
-                }
-                items.push(DetectItem {
-                    file: file_name,
-                    path: path_str,
-                    status: "processed".to_string(),
-                    skip_reason: None,
-                    detection: Some(candidate),
-                    error: None,
-                });
-            }
-            Err(err) => {
-                items.push(DetectItem {
-                    file: file_name,
-                    path: path_str,
-                    status: "error".to_string(),
-                    skip_reason: None,
-                    detection: None,
-                    error: Some(format!("{err:#}")),
-                });
-            }
+const PREVIEW_SUBDIR: &str = "previews";
+const CANCELLED_MARKER: &str = "__croppy_cancelled__";
+
+struct App {
+    raws: Vec<PathBuf>,
+    selected: Vec<bool>,
+    write_xmp: bool,
+    write_preview: bool,
+    screen: Screen,
+    file_cursor: usize,
+    progress_done: usize,
+    progress_total: usize,
+    current_file: String,
+    results: Vec<FileResult>,
+    worker_rx: Option<Receiver<WorkerMsg>>,
+    worker_cancel: Option<Arc<AtomicBool>>,
+    cancel_requested: bool,
+    run_started_at: Option<Instant>,
+    run_finished_at: Option<Instant>,
+    select_notice: Option<String>,
+    overwrite_prompt_count: Option<usize>,
+    pipeline_stats: Option<Arc<PipelineStats>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct XmpCrop {
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    angle_deg: f32,
+}
+
+impl App {
+    fn new(raws: Vec<PathBuf>) -> Self {
+        let selected = vec![false; raws.len()];
+        Self {
+            raws,
+            selected,
+            write_xmp: false,
+            write_preview: false,
+            screen: Screen::Select,
+            file_cursor: 0,
+            progress_done: 0,
+            progress_total: 0,
+            current_file: String::new(),
+            results: Vec::new(),
+            worker_rx: None,
+            worker_cancel: None,
+            cancel_requested: false,
+            run_started_at: None,
+            run_finished_at: None,
+            select_notice: None,
+            overwrite_prompt_count: None,
+            pipeline_stats: None,
         }
     }
 
-    let report = DetectReport {
-        schema_version: "1".to_string(),
-        source_path: args.input.to_string_lossy().to_string(),
-        total_files_seen: items.len(),
-        total_processed: processed,
-        total_skipped: skipped,
-        items,
-    };
+    fn selected_paths(&self) -> Vec<PathBuf> {
+        self.raws
+            .iter()
+            .zip(self.selected.iter())
+            .filter_map(|(p, s)| if *s { Some(p.clone()) } else { None })
+            .collect()
+    }
+}
 
-    let json = serde_json::to_string_pretty(&report)?;
-    fs::write(&args.out, json)
-        .with_context(|| format!("Failed writing report: {}", args.out.display()))?;
-    println!(
-        "Done. processed={}, skipped={}, report={}",
-        report.total_processed,
-        report.total_skipped,
-        args.out.display()
-    );
+fn main() -> Result<()> {
+    let args = Args::parse();
+    let raws = discover_inputs(&args.input, args.recursive)?;
+    if raws.is_empty() {
+        return Err(anyhow!("no RAW files found under {}", args.input.display()));
+    }
+
+    let mut app = App::new(raws);
+    let mut terminal = setup_terminal()?;
+    let run_result = run_app(&mut terminal, &mut app, &args);
+    teardown_terminal(&mut terminal)?;
+    run_result
+}
+
+fn discover_inputs(input: &Path, recursive: bool) -> Result<Vec<PathBuf>> {
+    if input.is_file() {
+        if is_supported_raw(input) {
+            return Ok(vec![input.to_path_buf()]);
+        }
+        return Err(anyhow!("unsupported RAW file: {}", input.display()));
+    }
+    list_raw_files(input, recursive)
+}
+
+fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    Ok(Terminal::new(backend)?)
+}
+
+fn teardown_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
     Ok(())
 }
 
-fn discover_raw_files(input: &Path, recursive: bool) -> Result<Vec<PathBuf>> {
-    let exts = [
-        "arw", "cr2", "cr3", "nef", "nrw", "raf", "orf", "rw2", "dng", "pef",
-    ];
-    let mut out = Vec::new();
-    let mut walker = WalkDir::new(input).follow_links(false);
-    if !recursive {
-        walker = walker.max_depth(1);
-    }
-    for entry in walker {
-        let entry = entry?;
-        if !entry.file_type().is_file() {
+fn run_app(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    app: &mut App,
+    args: &Args,
+) -> Result<()> {
+    loop {
+        let mut worker_done = false;
+        if let Some(rx) = &app.worker_rx {
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    WorkerMsg::Started(s) => app.current_file = s,
+                    WorkerMsg::Finished(res) => {
+                        app.progress_done += 1;
+                        app.results.push(res);
+                    }
+                    WorkerMsg::Done => worker_done = true,
+                }
+            }
+        }
+        if worker_done {
+            app.worker_rx = None;
+            app.worker_cancel = None;
+            app.pipeline_stats = None;
+            app.run_finished_at = Some(Instant::now());
+            app.screen = Screen::Done;
+        }
+
+        terminal.draw(|f| {
+            let size = f.area();
+            match app.screen {
+                Screen::Select => draw_select(f, size, app, args),
+                Screen::Running => draw_running(f, size, app),
+                Screen::Done => draw_done(f, size, app, args),
+            }
+        })?;
+
+        if !event::poll(Duration::from_millis(100))? {
             continue;
         }
-        let path = entry.path();
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|s| s.to_ascii_lowercase())
-            .unwrap_or_default();
-        if exts.contains(&ext.as_str()) {
-            out.push(path.to_path_buf());
+        if let Event::Key(key) = event::read()? {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                return Ok(());
+            }
+            match app.screen {
+                Screen::Select => {
+                    if handle_select_key(app, args, key.code)? {
+                        return Ok(());
+                    }
+                }
+                Screen::Running => match key.code {
+                    KeyCode::Char('c') => {
+                        if let Some(cancel) = &app.worker_cancel {
+                            cancel.store(true, Ordering::Relaxed);
+                            app.cancel_requested = true;
+                        }
+                    }
+                    KeyCode::Char('q') => return Ok(()),
+                    _ => {}
+                },
+                Screen::Done => match key.code {
+                    KeyCode::Char('q') => return Ok(()),
+                    KeyCode::Esc | KeyCode::Enter => {
+                        app.screen = Screen::Select;
+                    }
+                    _ => {}
+                },
+            }
         }
     }
-    out.sort();
-    Ok(out)
 }
 
-fn has_xmp_sidecar(raw_path: &Path) -> bool {
-    let stem = match raw_path.file_stem().and_then(|s| s.to_str()) {
-        Some(v) => v,
-        None => return false,
+fn draw_select(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, app: &App, args: &Args) {
+    draw_screen_chrome(f, area, "Croppy", "Select Files");
+    let header_subline = if let Some(count) = app.overwrite_prompt_count {
+        Line::from(Span::styled(
+            format!(
+                "{count} selected files already have .xmp sidecars. Press y to overwrite, n to cancel."
+            ),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
+    } else if let Some(msg) = &app.select_notice {
+        Line::from(Span::styled(
+            msg.clone(),
+            Style::default().fg(Color::Yellow),
+        ))
+    } else {
+        Line::from(Span::styled(
+            "Toggle run options inline, then launch directly.",
+            Style::default().fg(Color::DarkGray),
+        ))
     };
-    let parent = match raw_path.parent() {
-        Some(v) => v,
-        None => return false,
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Min(8),
+            Constraint::Length(3),
+        ])
+        .split(inner_area(area));
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(20), Constraint::Length(28)])
+        .split(chunks[1]);
+    let selected_count = app.selected.iter().filter(|v| **v).count();
+    let header = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled(
+                format!("Selected {} / {}", selected_count, app.raws.len()),
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("Cursor {}", app.file_cursor + 1),
+                Style::default().fg(Color::Gray),
+            ),
+        ]),
+        header_subline,
+    ])
+    .block(panel("Selection", false));
+    f.render_widget(header, chunks[0]);
+
+    let start = app.file_cursor.saturating_sub(15);
+    let end = (start + 30).min(app.raws.len());
+    let mut items = Vec::new();
+    for i in start..end {
+        let mark = if app.selected[i] { "[x]" } else { "[ ]" };
+        let line = format!("{mark} {}", app.raws[i].display());
+        let style = if i == app.file_cursor {
+            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        } else if app.selected[i] {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default()
+        };
+        items.push(ListItem::new(Line::from(Span::styled(line, style))));
+    }
+    let list = List::new(items).block(panel("RAW Files", true));
+    f.render_widget(list, body[0]);
+
+    let side = Paragraph::new(vec![
+        Line::from(Span::styled(
+            "Run Options",
+            Style::default().fg(Color::Gray),
+        )),
+        Line::from(vec![
+            Span::styled("[x] ", key_style()),
+            Span::raw(format!(
+                "XMP Sidecars: {}",
+                if app.write_xmp { "ON" } else { "OFF" }
+            )),
+        ]),
+        Line::from(vec![
+            Span::styled("[v] ", key_style()),
+            Span::raw(format!(
+                "Previews: {}",
+                if app.write_preview { "ON" } else { "OFF" }
+            )),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Preview Out: ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                preview_dir(&args.out_dir).display().to_string(),
+                Style::default().fg(Color::White),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled("Confirm", Style::default().fg(Color::Gray))),
+        Line::from("Press Enter to start"),
+    ])
+    .block(panel("Run Plan", false));
+    f.render_widget(side, body[1]);
+
+    let footer = Paragraph::new(Line::from(vec![
+        Span::styled("Up/Down", key_style()),
+        Span::raw(" move  "),
+        Span::styled("Space", key_style()),
+        Span::raw(" toggle  "),
+        Span::styled("a", key_style()),
+        Span::raw(" all  "),
+        Span::styled("u", key_style()),
+        Span::raw(" all-without-xmp  "),
+        Span::styled("n", key_style()),
+        Span::raw(" none  "),
+        Span::styled("x", key_style()),
+        Span::raw(" xmp  "),
+        Span::styled("v", key_style()),
+        Span::raw(" preview  "),
+        Span::styled("y/n", key_style()),
+        Span::raw(" confirm overwrite  "),
+        Span::styled("Enter", key_style()),
+        Span::raw(" run"),
+    ]))
+    .block(panel("Keys", false));
+    f.render_widget(footer, chunks[2]);
+}
+
+fn draw_running(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, app: &App) {
+    draw_screen_chrome(f, area, "Croppy", "Running");
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(6),
+            Constraint::Length(6),
+            Constraint::Length(4),
+        ])
+        .split(inner_area(area));
+    let (ok_count, failed_count, canceled_count) = summarize_results(&app.results);
+    let pct = if app.progress_total == 0 {
+        0
+    } else {
+        ((app.progress_done as f64 / app.progress_total as f64) * 100.0).round() as u16
     };
-    parent.join(format!("{stem}.xmp")).exists() || parent.join(format!("{stem}.XMP")).exists()
+    let gauge_color = if app.cancel_requested {
+        Color::Yellow
+    } else {
+        accent()
+    };
+    let gauge = Gauge::default()
+        .block(panel("Progress", true))
+        .gauge_style(Style::default().fg(gauge_color).bg(Color::Black))
+        .label(format!(
+            "{pct}%  ({}/{})",
+            app.progress_done, app.progress_total
+        ))
+        .use_unicode(true)
+        .percent(pct.min(100));
+    f.render_widget(gauge, chunks[1]);
+
+    let elapsed = app
+        .run_started_at
+        .map(|t| format_duration(t.elapsed()))
+        .unwrap_or_else(|| "0s".to_string());
+    let buffered_line = if let Some(stats) = &app.pipeline_stats {
+        let buffered = stats.buffered_count.load(Ordering::Relaxed);
+        let peak = stats.buffered_peak.load(Ordering::Relaxed);
+        format!(
+            "Buffered: {buffered}/{} (peak {peak})",
+            stats.buffered_capacity
+        )
+    } else {
+        "Buffered: -".to_string()
+    };
+    let current = Paragraph::new(vec![
+        Line::from(format!("Elapsed: {elapsed}")),
+        Line::from(format!(
+            "Done: {ok_count} ok  {failed_count} failed  {canceled_count} canceled"
+        )),
+        Line::from(buffered_line),
+        Line::from(vec![
+            Span::styled("Current: ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                if app.current_file.is_empty() {
+                    "waiting"
+                } else {
+                    &app.current_file
+                },
+                Style::default().fg(Color::White),
+            ),
+        ]),
+        if app.cancel_requested {
+            Line::from(Span::styled(
+                "Cancellation requested; finishing in-flight files...",
+                Style::default().fg(Color::Yellow),
+            ))
+        } else {
+            Line::from(Span::raw(""))
+        },
+    ])
+    .block(panel("Status", false));
+    f.render_widget(current, chunks[0]);
+
+    let footer = Paragraph::new(Line::from(vec![
+        Span::styled("c", key_style()),
+        Span::raw(" cancel run  "),
+        Span::styled("q", key_style()),
+        Span::raw(" quit app"),
+    ]))
+    .block(panel("Keys", false));
+    f.render_widget(footer, chunks[2]);
 }
 
-fn load_catalog_cropped_paths(catalog_path: &Path) -> Result<HashSet<String>> {
-    let conn =
-        Connection::open_with_flags(catalog_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .with_context(|| {
-                format!(
-                    "Failed opening catalog read-only: {}",
-                    catalog_path.display()
-                )
-            })?;
-
-    let sql = r#"
-select
-  replace(r.absolutePath || fo.pathFromRoot || f.baseName || '.' || f.extension, '\', '/')
-from Adobe_images i
-join AgLibraryFile f on f.id_local=i.rootFile
-join AgLibraryFolder fo on fo.id_local=f.folder
-join AgLibraryRootFolder r on r.id_local=fo.rootFolder
-join Adobe_imageDevelopSettings ds on ds.image=i.id_local
-where ds.text like '%CropLeft%'
-   or ds.text like '%CropRight%'
-   or ds.text like '%CropTop%'
-   or ds.text like '%CropBottom%'
-   or ds.text like '%CropAngle%'
-"#;
-
-    let mut stmt = conn.prepare(sql)?;
-    let mut rows = stmt.query([])?;
-    let mut keys = HashSet::new();
-    while let Some(row) = rows.next()? {
-        let p: String = row.get(0)?;
-        keys.insert(p.to_ascii_lowercase());
+fn draw_done(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, app: &App, args: &Args) {
+    draw_screen_chrome(f, area, "Croppy", "Complete");
+    let (ok, failed, canceled) = summarize_results(&app.results);
+    let out_previews = preview_dir(&args.out_dir);
+    let elapsed = match (app.run_started_at, app.run_finished_at) {
+        (Some(start), Some(end)) => format_duration(end.saturating_duration_since(start)),
+        (Some(start), None) => format_duration(start.elapsed()),
+        _ => "0s".to_string(),
+    };
+    let mut text = vec![
+        Line::from(format!("Run complete in {elapsed}")),
+        Line::from(format!(
+            "Summary: {ok} ok / {failed} failed / {canceled} canceled"
+        )),
+        Line::from(format!("Preview dir: {}", out_previews.display())),
+    ];
+    if app.cancel_requested {
+        text.push(Line::from(Span::styled(
+            "Run was canceled by user.",
+            Style::default().fg(Color::Yellow),
+        )));
     }
-    Ok(keys)
+    text.push(Line::from("Press Enter to return to file selection"));
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(6), Constraint::Length(3)])
+        .split(inner_area(area));
+    let p = Paragraph::new(text).block(panel("Run Summary", false));
+    f.render_widget(p, chunks[0]);
+    let footer = Paragraph::new(Line::from(vec![
+        Span::styled("Enter", key_style()),
+        Span::raw(" back to selection  "),
+        Span::styled("q", key_style()),
+        Span::raw(" exit"),
+    ]))
+    .block(panel("Keys", false));
+    f.render_widget(footer, chunks[1]);
 }
 
-fn normalize_path_key(path: &Path) -> String {
-    let raw = path.to_string_lossy().replace('\\', "/");
-    let parts: Vec<&str> = raw.split('/').collect();
-    if parts.len() >= 4 && parts[1] == "mnt" && parts[2].len() == 1 {
-        let drive = parts[2].to_ascii_uppercase();
-        let rest = parts[3..].join("/");
-        return format!("{drive}:/{rest}").to_ascii_lowercase();
-    }
-    raw.to_ascii_lowercase()
+fn accent() -> Color {
+    Color::White
 }
 
-fn process_one_raw(path: &Path, downscale_max: i32) -> Result<(CropCandidate, Mat)> {
-    let decoded = rawloader::decode_file(path)
-        .map_err(|e| anyhow!("raw decode failed for {}: {e}", path.display()))?;
-    let gray = raw_to_gray_mat(&decoded.data, decoded.width, decoded.height)?;
-    let gray = resize_long_edge(&gray, downscale_max)?;
+fn key_style() -> Style {
+    Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD)
+}
 
-    let mut blur = Mat::default();
-    imgproc::gaussian_blur(
-        &gray,
-        &mut blur,
-        Size::new(5, 5),
-        0.0,
-        0.0,
-        core::BORDER_DEFAULT,
-        core::AlgorithmHint::ALGO_HINT_DEFAULT,
-    )?;
+fn preview_dir(out_dir: &Path) -> PathBuf {
+    out_dir.join(PREVIEW_SUBDIR)
+}
 
-    let mut binary = Mat::default();
-    imgproc::threshold(
-        &blur,
-        &mut binary,
-        0.0,
-        255.0,
-        imgproc::THRESH_BINARY | imgproc::THRESH_OTSU,
-    )?;
+fn summarize_results(results: &[FileResult]) -> (usize, usize, usize) {
+    let ok = results.iter().filter(|r| r.error.is_none()).count();
+    let canceled = results.iter().filter(|r| is_canceled_result(r)).count();
+    let failed = results
+        .iter()
+        .filter(|r| matches!(r.error.as_deref(), Some(msg) if msg != CANCELLED_MARKER))
+        .count();
+    (ok, failed, canceled)
+}
 
-    let kernel =
-        imgproc::get_structuring_element(imgproc::MORPH_RECT, Size::new(5, 5), Point::new(-1, -1))?;
-    let mut morph = Mat::default();
-    imgproc::morphology_ex(
-        &binary,
-        &mut morph,
-        imgproc::MORPH_CLOSE,
-        &kernel,
-        Point::new(-1, -1),
-        2,
-        core::BORDER_CONSTANT,
-        Scalar::default(),
-    )?;
+fn is_canceled_result(result: &FileResult) -> bool {
+    matches!(result.error.as_deref(), Some(CANCELLED_MARKER))
+}
 
-    let mut contours: Vector<Vector<Point>> = Vector::new();
-    imgproc::find_contours(
-        &morph,
-        &mut contours,
-        imgproc::RETR_EXTERNAL,
-        imgproc::CHAIN_APPROX_SIMPLE,
-        Point::new(0, 0),
-    )?;
-    if contours.is_empty() {
-        return Err(anyhow!("no contours found"));
+fn format_duration(dur: Duration) -> String {
+    let secs = dur.as_secs();
+    let mins = secs / 60;
+    let rem = secs % 60;
+    if mins > 0 {
+        format!("{mins}m {rem}s")
+    } else {
+        format!("{rem}s")
+    }
+}
+
+fn panel(title: &str, focused: bool) -> Block<'_> {
+    let border_style = if focused {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    Block::default()
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::default().fg(Color::White),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border_style)
+}
+
+fn draw_screen_chrome(
+    f: &mut ratatui::Frame<'_>,
+    area: ratatui::layout::Rect,
+    brand: &str,
+    screen: &str,
+) {
+    let frame = Block::default()
+        .title(Line::from(vec![
+            Span::styled(
+                format!(" {brand} "),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(screen, Style::default().fg(Color::DarkGray)),
+        ]))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+    f.render_widget(frame, area);
+}
+
+fn inner_area(area: ratatui::layout::Rect) -> ratatui::layout::Rect {
+    ratatui::layout::Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    }
+}
+
+fn handle_select_key(app: &mut App, args: &Args, code: KeyCode) -> Result<bool> {
+    if app.overwrite_prompt_count.is_some() {
+        match code {
+            KeyCode::Char('q') => return Ok(true),
+            KeyCode::Char('y') | KeyCode::Enter => {
+                start_run(app, args, true)?;
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                app.overwrite_prompt_count = None;
+                app.select_notice = Some("Run canceled before overwrite.".to_string());
+            }
+            _ => {}
+        }
+        return Ok(false);
     }
 
-    let mut best_idx = 0;
-    let mut best_area = 0.0f64;
-    for (i, c) in contours.iter().enumerate() {
-        let area = imgproc::contour_area(&c, false)?;
-        if area > best_area {
-            best_area = area;
-            best_idx = i;
+    match code {
+        KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
+        KeyCode::Up => app.file_cursor = app.file_cursor.saturating_sub(1),
+        KeyCode::Down => app.file_cursor = (app.file_cursor + 1).min(app.raws.len() - 1),
+        KeyCode::Char('x') => {
+            app.write_xmp = !app.write_xmp;
+            app.select_notice = None;
+        }
+        KeyCode::Char('v') => {
+            app.write_preview = !app.write_preview;
+            app.select_notice = None;
+        }
+        KeyCode::Char(' ') => {
+            if let Some(v) = app.selected.get_mut(app.file_cursor) {
+                *v = !*v;
+            }
+            app.select_notice = None;
+        }
+        KeyCode::Char('a') => {
+            app.selected.fill(true);
+            app.select_notice = None;
+        }
+        KeyCode::Char('n') => {
+            app.selected.fill(false);
+            app.select_notice = None;
+        }
+        KeyCode::Char('u') => {
+            let mut selected_count = 0usize;
+            for (idx, raw) in app.raws.iter().enumerate() {
+                let keep = !raw.with_extension("xmp").exists();
+                app.selected[idx] = keep;
+                if keep {
+                    selected_count += 1;
+                }
+            }
+            app.select_notice = Some(format!(
+                "Selected {selected_count} files that do not already have .xmp sidecars."
+            ));
+        }
+        KeyCode::Enter => {
+            start_run(app, args, false)?;
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+fn start_run(app: &mut App, args: &Args, overwrite_confirmed: bool) -> Result<()> {
+    let files = app.selected_paths();
+    if files.is_empty() {
+        app.select_notice = Some("Select at least one RAW file before running.".to_string());
+        return Ok(());
+    }
+    if !app.write_xmp && !app.write_preview {
+        app.select_notice =
+            Some("Enable at least one output option (XMP sidecars or previews).".to_string());
+        return Ok(());
+    }
+    if app.write_xmp && !overwrite_confirmed {
+        let overwrite_count = files
+            .iter()
+            .filter(|raw| raw.with_extension("xmp").exists())
+            .count();
+        if overwrite_count > 0 {
+            app.overwrite_prompt_count = Some(overwrite_count);
+            app.select_notice = None;
+            return Ok(());
         }
     }
-    let best = contours.get(best_idx)?;
-    let rect = imgproc::min_area_rect(&best)?;
-    let size = gray.size()?;
 
-    let rect_center = rect.center;
-    let rect_w = rect.size.width.max(1.0);
-    let rect_h = rect.size.height.max(1.0);
-    let left = ((rect_center.x - rect_w / 2.0) / size.width as f32).clamp(0.0, 1.0);
-    let right = ((rect_center.x + rect_w / 2.0) / size.width as f32).clamp(0.0, 1.0);
-    let top = ((rect_center.y - rect_h / 2.0) / size.height as f32).clamp(0.0, 1.0);
-    let bottom = ((rect_center.y + rect_h / 2.0) / size.height as f32).clamp(0.0, 1.0);
-    let area_ratio = (rect_w * rect_h) as f64 / (size.width * size.height) as f64;
-    let confidence = area_ratio.clamp(0.0, 1.0) as f32;
-
-    let candidate = CropCandidate {
-        crop_left: left,
-        crop_top: top,
-        crop_right: right,
-        crop_bottom: bottom,
-        crop_angle: normalize_angle(rect.angle),
-        confidence,
+    app.overwrite_prompt_count = None;
+    app.select_notice = None;
+    app.progress_total = files.len();
+    app.progress_done = 0;
+    app.current_file.clear();
+    app.results.clear();
+    app.cancel_requested = false;
+    app.run_started_at = Some(Instant::now());
+    app.run_finished_at = None;
+    let opts = RunOptions {
+        write_xmp: app.write_xmp,
+        write_preview: app.write_preview,
+        max_edge: args.max_edge,
+        out_dir: args.out_dir.clone(),
     };
-
-    let mut preview = Mat::default();
-    imgproc::cvt_color(
-        &gray,
-        &mut preview,
-        imgproc::COLOR_GRAY2BGR,
-        0,
-        core::AlgorithmHint::ALGO_HINT_DEFAULT,
-    )?;
-    draw_rotated_rect(&mut preview, rect)?;
-    let label = format!(
-        "L {:.4} T {:.4} R {:.4} B {:.4} A {:.3}",
-        candidate.crop_left,
-        candidate.crop_top,
-        candidate.crop_right,
-        candidate.crop_bottom,
-        candidate.crop_angle
-    );
-    imgproc::put_text(
-        &mut preview,
-        &label,
-        Point::new(20, 40),
-        imgproc::FONT_HERSHEY_SIMPLEX,
-        0.9,
-        Scalar::new(0.0, 255.0, 0.0, 0.0),
-        2,
-        imgproc::LINE_AA,
-        false,
-    )?;
-    Ok((candidate, preview))
-}
-
-fn normalize_angle(angle: f32) -> f32 {
-    if angle > 45.0 { angle - 90.0 } else { angle }
-}
-
-fn draw_rotated_rect(img: &mut Mat, rect: core::RotatedRect) -> Result<()> {
-    let mut pts = [Point2f::default(); 4];
-    rect.points(&mut pts)?;
-    for i in 0..4 {
-        let p1 = Point::new(pts[i].x.round() as i32, pts[i].y.round() as i32);
-        let p2 = Point::new(
-            pts[(i + 1) % 4].x.round() as i32,
-            pts[(i + 1) % 4].y.round() as i32,
-        );
-        imgproc::line(
-            img,
-            p1,
-            p2,
-            Scalar::new(0.0, 0.0, 255.0, 0.0),
-            3,
-            imgproc::LINE_AA,
-            0,
-        )?;
-    }
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (rx, stats) = spawn_worker(files, opts, cancel.clone())?;
+    app.worker_rx = Some(rx);
+    app.worker_cancel = Some(cancel);
+    app.pipeline_stats = Some(stats);
+    app.screen = Screen::Running;
     Ok(())
 }
 
-fn write_preview(path: &Path, mat: &Mat) -> Result<()> {
-    let params: Vector<i32> = Vector::new();
-    let ok = imgcodecs::imwrite(path.to_string_lossy().as_ref(), mat, &params)?;
-    if !ok {
-        return Err(anyhow!("OpenCV imwrite failed for {}", path.display()));
-    }
-    Ok(())
+fn spawn_worker(
+    files: Vec<PathBuf>,
+    opts: RunOptions,
+    cancel: Arc<AtomicBool>,
+) -> Result<(Receiver<WorkerMsg>, Arc<PipelineStats>)> {
+    fs::create_dir_all(preview_dir(&opts.out_dir))?;
+    let (tx, rx) = mpsc::channel();
+    let cores = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let buffered_jobs = cores.max(1);
+    let stats = Arc::new(PipelineStats::new(buffered_jobs));
+    let stats_for_worker = Arc::clone(&stats);
+    thread::spawn(move || {
+        // Keep a meaningful reader stage on high-core systems so processors are not starved.
+        let read_workers = (cores / 3).clamp(2, 8);
+        let process_workers = cores.saturating_sub(read_workers).max(2);
+        let buffered_jobs = stats_for_worker.buffered_capacity;
+
+        let queue = Arc::new(Mutex::new(VecDeque::from(files)));
+        let (raw_tx, raw_rx) = mpsc::sync_channel::<RawBytesJob>(buffered_jobs);
+        let shared_raw_rx = Arc::new(Mutex::new(raw_rx));
+
+        let mut process_handles = Vec::with_capacity(process_workers);
+        for _ in 0..process_workers {
+            let opts_cloned = opts.clone();
+            let tx_cloned = tx.clone();
+            let cancel_cloned = Arc::clone(&cancel);
+            let raw_rx_cloned = Arc::clone(&shared_raw_rx);
+            let stats_cloned = Arc::clone(&stats_for_worker);
+            process_handles.push(thread::spawn(move || {
+                loop {
+                    let next_job = {
+                        let rx_guard = raw_rx_cloned.lock().expect("raw_rx mutex poisoned");
+                        rx_guard.recv()
+                    };
+                    let Ok(job) = next_job else {
+                        break;
+                    };
+                    stats_cloned.dec_buffered();
+                    let res = process_raw_bytes_job(job, &opts_cloned, &tx_cloned, &cancel_cloned);
+                    let _ = tx_cloned.send(WorkerMsg::Finished(res));
+                }
+            }));
+        }
+
+        let mut read_handles = Vec::with_capacity(read_workers);
+        for _ in 0..read_workers {
+            let queue_cloned = Arc::clone(&queue);
+            let raw_tx_cloned = raw_tx.clone();
+            let tx_cloned = tx.clone();
+            let cancel_cloned = Arc::clone(&cancel);
+            let stats_cloned = Arc::clone(&stats_for_worker);
+            read_handles.push(thread::spawn(move || {
+                loop {
+                    let maybe_raw = {
+                        let mut guard = queue_cloned.lock().expect("queue mutex poisoned");
+                        guard.pop_front()
+                    };
+                    let Some(raw) = maybe_raw else {
+                        break;
+                    };
+
+                    if cancel_cloned.load(Ordering::Relaxed) {
+                        let _ = tx_cloned.send(WorkerMsg::Finished(canceled_result()));
+                        continue;
+                    }
+
+                    let _ = tx_cloned.send(WorkerMsg::Started(format!("read: {}", raw.display())));
+                    match fs::read(&raw) {
+                        Ok(bytes) => {
+                            if cancel_cloned.load(Ordering::Relaxed) {
+                                let _ = tx_cloned.send(WorkerMsg::Finished(canceled_result()));
+                                continue;
+                            }
+                            if raw_tx_cloned.send(RawBytesJob { raw, bytes }).is_err() {
+                                break;
+                            }
+                            stats_cloned.inc_buffered();
+                        }
+                        Err(err) => {
+                            let _ = tx_cloned.send(WorkerMsg::Finished(FileResult {
+                                preview: None,
+                                xmp: None,
+                                error: Some(format!(
+                                    "raw read failed for {}: {err}",
+                                    raw.display()
+                                )),
+                            }));
+                        }
+                    }
+                }
+            }));
+        }
+        drop(raw_tx);
+
+        for handle in read_handles {
+            let _ = handle.join();
+        }
+        for handle in process_handles {
+            let _ = handle.join();
+        }
+
+        let _ = tx.send(WorkerMsg::Done);
+    });
+    Ok((rx, stats))
 }
 
-fn raw_to_gray_mat(data: &RawImageData, width: usize, height: usize) -> Result<Mat> {
-    let pixels: Vec<u8> = match data {
-        RawImageData::Integer(v) => {
-            let max_v = v.iter().copied().max().unwrap_or(1) as f32;
-            v.iter()
-                .map(|px| ((*px as f32 / max_v) * 255.0).round().clamp(0.0, 255.0) as u8)
-                .collect()
-        }
-        RawImageData::Float(v) => {
-            let max_v = v
-                .iter()
-                .copied()
-                .fold(0.0f32, |a, b| if b > a { b } else { a })
-                .max(1.0);
-            v.iter()
-                .map(|px| ((*px / max_v) * 255.0).round().clamp(0.0, 255.0) as u8)
-                .collect()
-        }
+fn process_raw_bytes_job(
+    job: RawBytesJob,
+    opts: &RunOptions,
+    tx: &Sender<WorkerMsg>,
+    cancel: &AtomicBool,
+) -> FileResult {
+    let RawBytesJob { raw, bytes } = job;
+    if cancel.load(Ordering::Relaxed) {
+        return canceled_result();
+    }
+    let _ = tx.send(WorkerMsg::Started(format!("process: {}", raw.display())));
+
+    let mut out = FileResult {
+        preview: None,
+        xmp: None,
+        error: None,
     };
-    if pixels.len() != width * height {
+
+    let res = (|| -> Result<()> {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(anyhow!(CANCELLED_MARKER));
+        }
+        let rgb_full = decode_raw_bytes_to_rgb(&bytes, &raw)?;
+        if cancel.load(Ordering::Relaxed) {
+            return Err(anyhow!(CANCELLED_MARKER));
+        }
+        let rgb = resize_rgb_max_edge(&rgb_full, opts.max_edge);
+        let gray = rgb_to_gray(&rgb);
+        let preprocess_cfg = PreprocessConfig {
+            invert: true,
+            flip_180: true,
+            black_pct: 2.0,
+            white_pct: 80.0,
+            knee_pct: 2.0,
+        };
+        let prepared = prepare_image(gray, preprocess_cfg);
+        if cancel.load(Ordering::Relaxed) {
+            return Err(anyhow!(CANCELLED_MARKER));
+        }
+        let prep_gray = rgb_to_gray(&prepared);
+        // Match the example Step 02 defaults so previews and debug runs align.
+        let detect_cfg = DetectConfig {
+            band_margin_pct: 0.22, // same as step02 example default
+        };
+        let refine = run_detection_with_rotation_refine(
+            &prep_gray,
+            detect_cfg,
+            RotationRefineConfig {
+                refine_rotation: true,
+                apply_rotation_decision: true,
+                max_refine_abs_deg: 3.0,
+            },
+        )
+        .ok_or_else(|| anyhow!("boundary detection failed"))?;
+
+        if opts.write_preview {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(anyhow!(CANCELLED_MARKER));
+            }
+            let mut overlay = prepared.clone();
+            draw_norm_rect(
+                &mut overlay,
+                refine.detection_initial.outer,
+                image::Rgb([255, 0, 0]),
+            );
+            draw_norm_rect(
+                &mut overlay,
+                refine.detection_initial.inner,
+                image::Rgb([255, 255, 0]),
+            );
+            if let (Some(refined_det), Some(applied)) =
+                (refine.detection_refined, refine.rotation_applied_deg)
+            {
+                draw_refined_inner_backproject(
+                    &mut overlay,
+                    refined_det.inner,
+                    applied.to_radians(),
+                    image::Rgb([80, 255, 255]),
+                );
+            }
+            let preview_path = preview_path_for(&raw, &opts.out_dir);
+            guard_write_target(&raw, &preview_path, "preview")?;
+            overlay.save_with_format(&preview_path, image::ImageFormat::Jpeg)?;
+            out.preview = Some(preview_path);
+        }
+
+        if opts.write_xmp {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(anyhow!(CANCELLED_MARKER));
+            }
+            let xmp_crop = xmp_crop_from_detection(
+                refine.detection.inner,
+                refine.rotation_applied_deg,
+                preprocess_cfg.flip_180,
+            );
+            let xmp_path = raw.with_extension("xmp");
+            guard_write_target(&raw, &xmp_path, "xmp sidecar")?;
+            write_xmp_sidecar(
+                &xmp_path,
+                xmp_crop.left,
+                xmp_crop.top,
+                xmp_crop.right,
+                xmp_crop.bottom,
+                xmp_crop.angle_deg,
+            )?;
+            out.xmp = Some(xmp_path);
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = res {
+        if e.to_string() == CANCELLED_MARKER {
+            out = canceled_result();
+        } else {
+            out.error = Some(e.to_string());
+        }
+    }
+    out
+}
+
+fn preview_path_for(raw: &Path, out_dir: &Path) -> PathBuf {
+    let mut base = raw
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("preview")
+        .to_string();
+    base.push_str(".jpg");
+    preview_dir(out_dir).join(base)
+}
+
+fn canceled_result() -> FileResult {
+    FileResult {
+        preview: None,
+        xmp: None,
+        error: Some(CANCELLED_MARKER.to_string()),
+    }
+}
+
+fn xmp_crop_from_detection(
+    inner_detected: BoundsNorm,
+    rotation_applied_deg: Option<f32>,
+    preprocess_flip_180: bool,
+) -> XmpCrop {
+    let mut bounds = inner_detected;
+    if preprocess_flip_180 {
+        // Detection runs in a frame rotated 180 degrees; mirror bounds back so
+        // sidecar geometry matches RAW orientation. CropAngle sign conversion is
+        // handled separately below.
+        bounds = rotate_bounds_180(bounds);
+    }
+    bounds = normalize_bounds(bounds);
+    XmpCrop {
+        left: bounds.left,
+        top: bounds.top,
+        right: bounds.right,
+        bottom: bounds.bottom,
+        // Internal refine rotates image pixels by `rotation_applied_deg`, while
+        // Lightroom's CropAngle uses the opposite sign convention.
+        angle_deg: -rotation_applied_deg.unwrap_or(0.0),
+    }
+}
+
+fn rotate_bounds_180(b: BoundsNorm) -> BoundsNorm {
+    BoundsNorm {
+        left: 1.0 - b.right,
+        top: 1.0 - b.bottom,
+        right: 1.0 - b.left,
+        bottom: 1.0 - b.top,
+    }
+}
+
+fn normalize_bounds(b: BoundsNorm) -> BoundsNorm {
+    let mut left = b.left.clamp(0.0, 1.0);
+    let mut right = b.right.clamp(0.0, 1.0);
+    let mut top = b.top.clamp(0.0, 1.0);
+    let mut bottom = b.bottom.clamp(0.0, 1.0);
+    if left > right {
+        std::mem::swap(&mut left, &mut right);
+    }
+    if top > bottom {
+        std::mem::swap(&mut top, &mut bottom);
+    }
+    BoundsNorm {
+        left,
+        top,
+        right,
+        bottom,
+    }
+}
+
+fn guard_write_target(raw: &Path, target: &Path, output_kind: &str) -> Result<()> {
+    if raw == target {
         return Err(anyhow!(
-            "unexpected pixel count {} for {}x{}",
-            pixels.len(),
-            width,
-            height
+            "refusing to write {output_kind}: target path equals source RAW path ({})",
+            raw.display()
         ));
     }
-    let mat = Mat::from_slice(&pixels)?;
-    let reshaped = mat.reshape(1, height as i32)?;
-    Ok(reshaped.try_clone()?)
+    if is_supported_raw(target) {
+        return Err(anyhow!(
+            "refusing to write {output_kind}: target has RAW extension ({})",
+            target.display()
+        ));
+    }
+
+    let raw_abs = fs::canonicalize(raw).unwrap_or_else(|_| raw.to_path_buf());
+    let target_abs = fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
+    if raw_abs == target_abs {
+        return Err(anyhow!(
+            "refusing to write {output_kind}: target resolves to source RAW path ({})",
+            target.display()
+        ));
+    }
+
+    if let (Ok(raw_meta), Ok(target_meta)) = (fs::metadata(raw), fs::metadata(target)) {
+        #[cfg(unix)]
+        {
+            if raw_meta.dev() == target_meta.dev() && raw_meta.ino() == target_meta.ino() {
+                return Err(anyhow!(
+                    "refusing to write {output_kind}: target points to same file inode as source RAW ({})",
+                    target.display()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
-fn resize_long_edge(src: &Mat, max_dim: i32) -> Result<Mat> {
-    let size = src.size()?;
-    let w = size.width;
-    let h = size.height;
-    let long = w.max(h);
-    if long <= max_dim {
-        return Ok(src.try_clone()?);
+fn write_xmp_sidecar(
+    path: &Path,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    angle_deg: f32,
+) -> Result<()> {
+    let xmp = format!(
+        concat!(
+            "<?xpacket begin=\"\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n",
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n",
+            " <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n",
+            "  <rdf:Description rdf:about=\"\"\n",
+            "    xmlns:crs=\"http://ns.adobe.com/camera-raw-settings/1.0/\"\n",
+            "    crs:HasCrop=\"True\"\n",
+            "    crs:CropConstrainAspectRatio=\"True\"\n",
+            "    crs:CropLeft=\"{left:.6}\"\n",
+            "    crs:CropTop=\"{top:.6}\"\n",
+            "    crs:CropRight=\"{right:.6}\"\n",
+            "    crs:CropBottom=\"{bottom:.6}\"\n",
+            "    crs:CropAngle=\"{angle:.6}\" />\n",
+            " </rdf:RDF>\n",
+            "</x:xmpmeta>\n",
+            "<?xpacket end=\"w\"?>\n"
+        ),
+        left = left,
+        top = top,
+        right = right,
+        bottom = bottom,
+        angle = angle_deg
+    );
+    fs::write(path, xmp)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BoundsNorm, xmp_crop_from_detection};
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() < 1e-6,
+            "expected {expected}, got {actual}"
+        );
     }
-    let scale = max_dim as f64 / long as f64;
-    let new_w = (w as f64 * scale).round() as i32;
-    let new_h = (h as f64 * scale).round() as i32;
-    let mut dst = Mat::default();
-    imgproc::resize(
-        src,
-        &mut dst,
-        Size::new(new_w, new_h),
-        0.0,
-        0.0,
-        imgproc::INTER_AREA,
-    )?;
-    Ok(dst)
+
+    #[test]
+    fn xmp_crop_keeps_bounds_without_flip() {
+        let out = xmp_crop_from_detection(
+            BoundsNorm {
+                left: 0.1,
+                top: 0.2,
+                right: 0.8,
+                bottom: 0.9,
+            },
+            Some(-0.5),
+            false,
+        );
+        assert_close(out.left, 0.1);
+        assert_close(out.top, 0.2);
+        assert_close(out.right, 0.8);
+        assert_close(out.bottom, 0.9);
+        assert_close(out.angle_deg, 0.5);
+    }
+
+    #[test]
+    fn xmp_crop_mirrors_bounds_when_preprocess_flipped() {
+        let out = xmp_crop_from_detection(
+            BoundsNorm {
+                left: 0.1,
+                top: 0.2,
+                right: 0.8,
+                bottom: 0.9,
+            },
+            Some(1.25),
+            true,
+        );
+        assert_close(out.left, 0.2);
+        assert_close(out.top, 0.1);
+        assert_close(out.right, 0.9);
+        assert_close(out.bottom, 0.8);
+        assert_close(out.angle_deg, -1.25);
+    }
+
+    #[test]
+    fn xmp_crop_clamps_and_normalizes_bounds() {
+        let out = xmp_crop_from_detection(
+            BoundsNorm {
+                left: 1.2,
+                top: 0.9,
+                right: -0.1,
+                bottom: 0.2,
+            },
+            None,
+            false,
+        );
+        assert_close(out.left, 0.0);
+        assert_close(out.top, 0.2);
+        assert_close(out.right, 1.0);
+        assert_close(out.bottom, 0.9);
+        assert_close(out.angle_deg, 0.0);
+    }
 }

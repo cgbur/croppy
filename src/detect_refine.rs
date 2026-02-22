@@ -1,0 +1,554 @@
+use image::imageops::crop_imm;
+use image::{GrayImage, Luma, Rgb, RgbImage};
+use imageproc::drawing::draw_line_segment_mut;
+use imageproc::geometric_transformations::{Interpolation, rotate_about_center};
+use serde::Serialize;
+
+use crate::detect::{BoundsNorm, DetectConfig, Detection, detect_bounds_with_debug_cfg};
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct EdgeLineRotation {
+    pub angle_deg: f32,
+    pub top_deg: Option<f32>,
+    pub bottom_deg: Option<f32>,
+    pub left_deg: Option<f32>,
+    pub right_deg: Option<f32>,
+    pub points_top: usize,
+    pub points_bottom: usize,
+    pub points_left: usize,
+    pub points_right: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RotationDebug {
+    pub summary: EdgeLineRotation,
+    pub inner_px: [i32; 4],
+    pub top_points: Vec<[f32; 2]>,
+    pub bottom_points: Vec<[f32; 2]>,
+    pub left_points: Vec<[f32; 2]>,
+    pub right_points: Vec<[f32; 2]>,
+    pub top_fit: Option<[f32; 2]>,    // y = m*x + b
+    pub bottom_fit: Option<[f32; 2]>, // y = m*x + b
+    pub left_fit: Option<[f32; 2]>,   // x = m*y + b
+    pub right_fit: Option<[f32; 2]>,  // x = m*y + b
+    pub legend: RotationLegend,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RotationLegend {
+    pub top_points: &'static str,
+    pub bottom_points: &'static str,
+    pub left_points: &'static str,
+    pub right_points: &'static str,
+    pub top_line: &'static str,
+    pub bottom_line: &'static str,
+    pub left_line: &'static str,
+    pub right_line: &'static str,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RotationRefineConfig {
+    pub refine_rotation: bool,
+    pub apply_rotation_decision: bool,
+    pub max_refine_abs_deg: f32,
+}
+
+impl Default for RotationRefineConfig {
+    fn default() -> Self {
+        Self {
+            refine_rotation: true,
+            apply_rotation_decision: true,
+            max_refine_abs_deg: 3.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DetectRefineRun {
+    pub detection_initial: Detection,
+    pub detection_refined: Option<Detection>,
+    pub detection: Detection,
+    pub rotation_initial_debug: Option<RotationDebug>,
+    pub rotation_estimate: Option<EdgeLineRotation>,
+    pub rotation_applied_deg: Option<f32>,
+    pub rotation_residual_deg: Option<f32>,
+}
+
+pub fn run_detection_with_rotation_refine(
+    gray: &GrayImage,
+    detect_cfg: DetectConfig,
+    refine_cfg: RotationRefineConfig,
+) -> Option<DetectRefineRun> {
+    let (det, _dbg) = detect_bounds_with_debug_cfg(gray, detect_cfg)?;
+    let rotation_initial = rotation_debug_from_inner(gray, det.inner);
+    let rotation_estimate = rotation_initial.as_ref().map(|d| d.summary);
+
+    let mut final_detection = det;
+    let mut refined_detection = None;
+    let mut rotation_applied_deg = None;
+    let mut rotation_residual_deg = None;
+
+    if refine_cfg.refine_rotation
+        && refine_cfg.apply_rotation_decision
+        && let Some(est) = rotation_estimate
+        && est.angle_deg.abs() > 0.01
+    {
+        let apply_deg = (-est.angle_deg).clamp(
+            -refine_cfg.max_refine_abs_deg.abs(),
+            refine_cfg.max_refine_abs_deg.abs(),
+        );
+        let theta = apply_deg.to_radians();
+        let rotated = rotate_about_center(gray, theta, Interpolation::Bilinear, Luma([0u8]));
+        if let Some((det2, _dbg2)) = detect_bounds_with_debug_cfg(&rotated, detect_cfg) {
+            final_detection = det2;
+            refined_detection = Some(det2);
+            rotation_applied_deg = Some(apply_deg);
+            let rotation_refined_dbg = rotation_debug_from_inner(&rotated, det2.inner);
+            rotation_residual_deg = rotation_refined_dbg
+                .as_ref()
+                .map(|d| d.summary.angle_deg.abs());
+        }
+    }
+
+    Some(DetectRefineRun {
+        detection_initial: det,
+        detection_refined: refined_detection,
+        detection: final_detection,
+        rotation_initial_debug: rotation_initial,
+        rotation_estimate,
+        rotation_applied_deg,
+        rotation_residual_deg,
+    })
+}
+
+pub fn rotation_debug_from_inner(
+    gray: &image::GrayImage,
+    inner: BoundsNorm,
+) -> Option<RotationDebug> {
+    let w = gray.width() as i32;
+    let h = gray.height() as i32;
+    if w < 32 || h < 32 {
+        return None;
+    }
+    let x1 = ((inner.left * w as f32).round() as i32).clamp(2, w - 3);
+    let x2 = ((inner.right * w as f32).round() as i32).clamp(2, w - 3);
+    let y1 = ((inner.top * h as f32).round() as i32).clamp(2, h - 3);
+    let y2 = ((inner.bottom * h as f32).round() as i32).clamp(2, h - 3);
+    if x2 <= x1 + 16 || y2 <= y1 + 16 {
+        return None;
+    }
+
+    let band = (((x2 - x1).min(y2 - y1) as f32) * 0.04)
+        .round()
+        .clamp(4.0, 14.0) as i32;
+    let outward_slack = (band / 3).max(2);
+    let mx = (((x2 - x1) as f32) * 0.08).round().max(3.0) as i32;
+    let my = (((y2 - y1) as f32) * 0.08).round().max(3.0) as i32;
+    let sx = (((x2 - x1) as f32) / 140.0).round().clamp(1.0, 4.0) as i32;
+    let sy = (((y2 - y1) as f32) / 140.0).round().clamp(1.0, 4.0) as i32;
+
+    let mut top_raw = Vec::new();
+    let mut bottom_raw = Vec::new();
+    let mut left_raw = Vec::new();
+    let mut right_raw = Vec::new();
+
+    let mut x = x1 + mx;
+    while x <= x2 - mx {
+        if let Some(y) = pick_peak_y(gray, x, y1 - outward_slack, y1 + band) {
+            top_raw.push((x as f32, y as f32));
+        }
+        if let Some(y) = pick_peak_y(gray, x, y2 - band, y2 + outward_slack) {
+            bottom_raw.push((x as f32, y as f32));
+        }
+        x += sx;
+    }
+
+    let mut y = y1 + my;
+    while y <= y2 - my {
+        if let Some(xp) = pick_peak_x(gray, x1 - outward_slack, x1 + band, y) {
+            left_raw.push((xp as f32, y as f32));
+        }
+        if let Some(xp) = pick_peak_x(gray, x2 - band, x2 + outward_slack, y) {
+            right_raw.push((xp as f32, y as f32));
+        }
+        y += sy;
+    }
+
+    let top_fit = fit_line_y_of_x(&top_raw);
+    let bottom_fit = fit_line_y_of_x(&bottom_raw);
+    let left_fit = fit_line_x_of_y(&left_raw);
+    let right_fit = fit_line_x_of_y(&right_raw);
+
+    let top_deg = top_fit.as_ref().map(horizontal_fit_angle_deg);
+    let bottom_deg = bottom_fit.as_ref().map(horizontal_fit_angle_deg);
+    let left_deg = left_fit.as_ref().map(vertical_fit_angle_deg);
+    let right_deg = right_fit.as_ref().map(vertical_fit_angle_deg);
+
+    let angle = pick_rotation_angle(
+        top_fit.as_ref(),
+        bottom_fit.as_ref(),
+        left_fit.as_ref(),
+        right_fit.as_ref(),
+    )?;
+
+    Some(RotationDebug {
+        summary: EdgeLineRotation {
+            angle_deg: angle,
+            top_deg,
+            bottom_deg,
+            left_deg,
+            right_deg,
+            points_top: top_raw.len(),
+            points_bottom: bottom_raw.len(),
+            points_left: left_raw.len(),
+            points_right: right_raw.len(),
+        },
+        inner_px: [x1, y1, x2, y2],
+        top_points: top_raw.iter().map(|(x, y)| [*x, *y]).collect(),
+        bottom_points: bottom_raw.iter().map(|(x, y)| [*x, *y]).collect(),
+        left_points: left_raw.iter().map(|(x, y)| [*x, *y]).collect(),
+        right_points: right_raw.iter().map(|(x, y)| [*x, *y]).collect(),
+        top_fit: top_fit.map(|f| [f.m, f.b]),
+        bottom_fit: bottom_fit.map(|f| [f.m, f.b]),
+        left_fit: left_fit.map(|f| [f.m, f.b]),
+        right_fit: right_fit.map(|f| [f.m, f.b]),
+        legend: RotationLegend {
+            top_points: "green points",
+            bottom_points: "cyan points",
+            left_points: "magenta points",
+            right_points: "orange points",
+            top_line: "green line",
+            bottom_line: "cyan line",
+            left_line: "magenta line",
+            right_line: "orange line",
+        },
+    })
+}
+
+fn pick_peak_y(gray: &image::GrayImage, x: i32, y_min: i32, y_max: i32) -> Option<i32> {
+    let h = gray.height() as i32;
+    let y1 = y_min.clamp(2, h - 3);
+    let y2 = y_max.clamp(2, h - 3);
+    if y2 < y1 {
+        return None;
+    }
+    let mut best_grad = 0.0f32;
+    let mut best_y = y1;
+    for y in y1..=y2 {
+        let a = gray.get_pixel(x as u32, (y - 1) as u32)[0] as f32;
+        let b = gray.get_pixel(x as u32, (y + 1) as u32)[0] as f32;
+        let g = (b - a).abs();
+        if g > best_grad {
+            best_grad = g;
+            best_y = y;
+        }
+    }
+    if best_grad < 4.0 { None } else { Some(best_y) }
+}
+
+fn pick_peak_x(gray: &image::GrayImage, x_min: i32, x_max: i32, y: i32) -> Option<i32> {
+    let w = gray.width() as i32;
+    let x1 = x_min.clamp(2, w - 3);
+    let x2 = x_max.clamp(2, w - 3);
+    if x2 < x1 {
+        return None;
+    }
+    let mut best_grad = 0.0f32;
+    let mut best_x = x1;
+    for x in x1..=x2 {
+        let a = gray.get_pixel((x - 1) as u32, y as u32)[0] as f32;
+        let b = gray.get_pixel((x + 1) as u32, y as u32)[0] as f32;
+        let g = (b - a).abs();
+        if g > best_grad {
+            best_grad = g;
+            best_x = x;
+        }
+    }
+    if best_grad < 4.0 { None } else { Some(best_x) }
+}
+
+#[derive(Clone)]
+struct ConsensusLineFit {
+    m: f32,
+    b: f32,
+    score: f32,
+}
+
+fn horizontal_fit_angle_deg(f: &ConsensusLineFit) -> f32 {
+    f.m.atan().to_degrees()
+}
+
+fn vertical_fit_angle_deg(f: &ConsensusLineFit) -> f32 {
+    // Vertical fits are represented as x = m*y + b. For the edge angle relative
+    // to the x-axis, this sign is opposite to y = m*x + b.
+    (-f.m).atan().to_degrees()
+}
+
+fn fit_line_y_of_x(points: &[(f32, f32)]) -> Option<ConsensusLineFit> {
+    let pairs: Vec<(f32, f32)> = points.iter().map(|(x, y)| (*x, *y)).collect();
+    consensus_fit_line_t_of_u(&pairs)
+}
+
+fn fit_line_x_of_y(points: &[(f32, f32)]) -> Option<ConsensusLineFit> {
+    let pairs: Vec<(f32, f32)> = points.iter().map(|(x, y)| (*y, *x)).collect();
+    consensus_fit_line_t_of_u(&pairs)
+}
+
+fn consensus_fit_line_t_of_u(points: &[(f32, f32)]) -> Option<ConsensusLineFit> {
+    if points.len() < 6 {
+        return None;
+    }
+
+    let (min_t, max_t) = points
+        .iter()
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |acc, p| {
+            (acc.0.min(p.0), acc.1.max(p.0))
+        });
+    let span_t = max_t - min_t;
+    if span_t <= 1e-3 {
+        return None;
+    }
+    let inlier_thresh = (span_t * 0.0035).clamp(0.8, 2.5);
+
+    let mut best_count = 0usize;
+    let mut best_err = f32::INFINITY;
+    let mut best_mb: Option<(f32, f32)> = None;
+
+    for i in 0..points.len() {
+        for j in (i + 1)..points.len() {
+            let (t1, u1) = points[i];
+            let (t2, u2) = points[j];
+            let dt = t2 - t1;
+            if dt.abs() <= 1e-3 {
+                continue;
+            }
+            let m = (u2 - u1) / dt;
+            let b = u1 - m * t1;
+
+            let mut count = 0usize;
+            let mut err = 0.0f32;
+            for (t, u) in points {
+                let r = (*u - (m * *t + b)).abs();
+                if r <= inlier_thresh {
+                    count += 1;
+                    err += r;
+                }
+            }
+
+            if count > best_count || (count == best_count && err < best_err) {
+                best_count = count;
+                best_err = err;
+                best_mb = Some((m, b));
+            }
+        }
+    }
+
+    let inlier_ratio = best_count as f32 / points.len() as f32;
+    if best_count < 6 || inlier_ratio < 0.55 {
+        return None;
+    }
+    let mean_inlier_residual = best_err / best_count as f32;
+    let span_score = span_t / (span_t + 120.0);
+    let residual_score = 1.0 / (1.0 + mean_inlier_residual);
+    let score = inlier_ratio * span_score * residual_score;
+
+    best_mb.map(|(m, b)| ConsensusLineFit { m, b, score })
+}
+
+fn pick_rotation_angle(
+    top: Option<&ConsensusLineFit>,
+    bottom: Option<&ConsensusLineFit>,
+    left: Option<&ConsensusLineFit>,
+    right: Option<&ConsensusLineFit>,
+) -> Option<f32> {
+    fn weighted_angle(edges: &[(f32, f32)]) -> Option<f32> {
+        let mut wsum = 0.0f32;
+        let mut asum = 0.0f32;
+        for (a, w) in edges {
+            if *w > 0.0 {
+                wsum += *w;
+                asum += *a * *w;
+            }
+        }
+        if wsum <= 1e-6 {
+            None
+        } else {
+            Some(asum / wsum)
+        }
+    }
+
+    let top_edge = top.map(|f| (horizontal_fit_angle_deg(f), f.score));
+    let bot_edge = bottom.map(|f| (horizontal_fit_angle_deg(f), f.score));
+    let left_edge = left.map(|f| (vertical_fit_angle_deg(f), f.score));
+    let right_edge = right.map(|f| (vertical_fit_angle_deg(f), f.score));
+
+    let mut horiz = Vec::new();
+    if let Some(e) = top_edge {
+        horiz.push(e);
+    }
+    if let Some(e) = bot_edge {
+        horiz.push(e);
+    }
+    let mut vert = Vec::new();
+    if let Some(e) = left_edge {
+        vert.push(e);
+    }
+    if let Some(e) = right_edge {
+        vert.push(e);
+    }
+
+    let h = weighted_angle(&horiz);
+    let v = weighted_angle(&vert);
+
+    match (h, v) {
+        (Some(ha), Some(va)) => {
+            if (ha - va).abs() <= 0.8 {
+                let hw = horiz.iter().map(|(_, w)| *w).sum::<f32>() * 1.5;
+                let vw = vert.iter().map(|(_, w)| *w).sum::<f32>();
+                weighted_angle(&[(ha, hw), (va, vw)])
+            } else {
+                Some(ha)
+            }
+        }
+        (Some(ha), None) => Some(ha),
+        (None, Some(va)) => Some(va),
+        (None, None) => None,
+    }
+}
+
+pub fn draw_norm_rect(img: &mut RgbImage, b: BoundsNorm, color: Rgb<u8>) {
+    let w = img.width() as f32;
+    let h = img.height() as f32;
+    let x1 = (b.left * w).clamp(0.0, w - 1.0);
+    let x2 = (b.right * w).clamp(0.0, w - 1.0);
+    let y1 = (b.top * h).clamp(0.0, h - 1.0);
+    let y2 = (b.bottom * h).clamp(0.0, h - 1.0);
+    draw_line_segment_mut(img, (x1, y1), (x2, y1), color);
+    draw_line_segment_mut(img, (x2, y1), (x2, y2), color);
+    draw_line_segment_mut(img, (x2, y2), (x1, y2), color);
+    draw_line_segment_mut(img, (x1, y2), (x1, y1), color);
+}
+
+pub fn draw_refined_inner_backproject(
+    img: &mut RgbImage,
+    inner_rot: BoundsNorm,
+    theta: f32,
+    color: Rgb<u8>,
+) {
+    let unrot =
+        refined_inner_backproject_px(inner_rot, theta, img.width() as f32, img.height() as f32);
+    for i in 0..4 {
+        let a = unrot[i];
+        let b = unrot[(i + 1) % 4];
+        draw_line_segment_mut(img, a, b, color);
+    }
+}
+
+pub fn save_norm_crop(
+    img: &RgbImage,
+    b: BoundsNorm,
+    out_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    let w = img.width() as f32;
+    let h = img.height() as f32;
+    let x1 = (b.left * w).round().clamp(0.0, w - 1.0) as u32;
+    let x2 = (b.right * w).round().clamp(0.0, w) as u32;
+    let y1 = (b.top * h).round().clamp(0.0, h - 1.0) as u32;
+    let y2 = (b.bottom * h).round().clamp(0.0, h) as u32;
+    let cw = x2.saturating_sub(x1).max(1);
+    let ch = y2.saturating_sub(y1).max(1);
+    let crop = crop_imm(img, x1, y1, cw, ch).to_image();
+    crop.save_with_format(out_path, image::ImageFormat::Jpeg)?;
+    Ok(())
+}
+
+pub fn refined_inner_backproject_px(
+    inner_rot: BoundsNorm,
+    theta: f32,
+    w: f32,
+    h: f32,
+) -> [(f32, f32); 4] {
+    let x1 = inner_rot.left * w;
+    let x2 = inner_rot.right * w;
+    let y1 = inner_rot.top * h;
+    let y2 = inner_rot.bottom * h;
+    let corners = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)];
+    let c = ((w - 1.0) * 0.5, (h - 1.0) * 0.5);
+    [
+        rotate_point(corners[0].0, corners[0].1, c.0, c.1, -theta),
+        rotate_point(corners[1].0, corners[1].1, c.0, c.1, -theta),
+        rotate_point(corners[2].0, corners[2].1, c.0, c.1, -theta),
+        rotate_point(corners[3].0, corners[3].1, c.0, c.1, -theta),
+    ]
+}
+
+pub fn refined_inner_backproject_norm(
+    inner_rot: BoundsNorm,
+    theta: f32,
+    w: f32,
+    h: f32,
+) -> [[f32; 2]; 4] {
+    let px = refined_inner_backproject_px(inner_rot, theta, w, h);
+    [
+        [(px[0].0 / w).clamp(0.0, 1.0), (px[0].1 / h).clamp(0.0, 1.0)],
+        [(px[1].0 / w).clamp(0.0, 1.0), (px[1].1 / h).clamp(0.0, 1.0)],
+        [(px[2].0 / w).clamp(0.0, 1.0), (px[2].1 / h).clamp(0.0, 1.0)],
+        [(px[3].0 / w).clamp(0.0, 1.0), (px[3].1 / h).clamp(0.0, 1.0)],
+    ]
+}
+
+pub fn rotate_rgb_about_center(img: &RgbImage, theta: f32) -> RgbImage {
+    rotate_about_center(img, theta, Interpolation::Bilinear, Rgb([0u8, 0u8, 0u8]))
+}
+
+fn rotate_point(x: f32, y: f32, cx: f32, cy: f32, theta: f32) -> (f32, f32) {
+    let dx = x - cx;
+    let dy = y - cy;
+    let ct = theta.cos();
+    let st = theta.sin();
+    (cx + dx * ct - dy * st, cy + dx * st + dy * ct)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fit_from_deg_y_of_x(deg: f32) -> ConsensusLineFit {
+        ConsensusLineFit {
+            m: deg.to_radians().tan(),
+            b: 0.0,
+            score: 1.0,
+        }
+    }
+
+    fn fit_from_deg_x_of_y(deg: f32) -> ConsensusLineFit {
+        // For x = m*y + b, m = -tan(theta) where theta is edge angle wrt x-axis.
+        ConsensusLineFit {
+            m: -deg.to_radians().tan(),
+            b: 0.0,
+            score: 1.0,
+        }
+    }
+
+    #[test]
+    fn pick_rotation_angle_does_not_cancel_from_vertical_sign_mismatch() {
+        let top = fit_from_deg_y_of_x(-0.30);
+        let bottom = fit_from_deg_y_of_x(-0.20);
+        let left = fit_from_deg_x_of_y(-0.40);
+        let right = fit_from_deg_x_of_y(-0.45);
+
+        let angle = pick_rotation_angle(Some(&top), Some(&bottom), Some(&left), Some(&right))
+            .expect("angle should be estimated");
+        assert!(angle < -0.2, "unexpected angle_deg={angle}");
+    }
+
+    #[test]
+    fn pick_rotation_angle_vertical_only_uses_same_sign_convention() {
+        let left = fit_from_deg_x_of_y(-0.35);
+        let right = fit_from_deg_x_of_y(-0.30);
+
+        let angle =
+            pick_rotation_angle(None, None, Some(&left), Some(&right)).expect("angle expected");
+        assert!(angle < -0.2, "unexpected angle_deg={angle}");
+    }
+}
