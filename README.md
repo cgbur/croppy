@@ -32,12 +32,11 @@ Useful flags:
 
 ```bash
 cargo run --release --example step02_detect_stub -- \
-  --input tmp/step01/next.json \
-  --out-dir tmp/step02
+  --input tmp/step01/next.json
 ```
 
 Sampling options:
-- `--band-margin-pct <f32>` (default `0.22`)
+- `--out-dir <PATH>` optional output directory (default: same directory as `--input`)
 - `--refine-rotation <true|false>` estimate from fixed inner-edge lines, rotate once, re-detect once (default `true`)
 - `--max-refine-abs-deg <f32>` max applied correction in degrees (default `3.0`)
 
@@ -61,12 +60,12 @@ Sampling options:
 ```
 
 Step 2 outputs:
-- `tmp/step02/overlay_initial.jpg` (red outer + yellow initial inner)
-- `tmp/step02/overlay.jpg` (same static image, plus cyan refined inner mapped back after rotation refine)
-- `tmp/step02/result.json` (normalized bounds + confidence + deterministic 4-edge rotation estimate)
-- `tmp/step02/debug.json` (raw vectors + chosen indices)
-- `tmp/step02/vertical_profile.csv`, `tmp/step02/horizontal_profile.csv`
-- `tmp/step02/vertical_profile_plot.jpg`, `tmp/step02/horizontal_profile_plot.jpg`
+- `tmp/step01/overlay_initial.jpg` (yellow initial inner)
+- `tmp/step01/overlay.jpg` (same static image, plus cyan refined inner mapped back after rotation refine)
+- `tmp/step01/result.json` (normalized bounds + confidence + deterministic 4-edge rotation estimate)
+- `tmp/step01/debug.json` (raw vectors + chosen indices)
+- `tmp/step01/vertical_profile.csv`, `tmp/step01/horizontal_profile.csv`
+- `tmp/step01/vertical_profile_plot.jpg`, `tmp/step01/horizontal_profile_plot.jpg`
 
 ## Main TUI
 
@@ -77,6 +76,11 @@ cargo run --release -- .
 TUI flow:
 - scan RAWs from path
 - choose actions (previews / sidecar writes)
+- preview mode toggle:
+- `Overlay` (debug boxes)
+- `Final Crop` (clean cropped image)
+- `Crop + Frame` (final crop on white background with padding)
+- optional final crop scale percent (`0.00%` default, positive expands crop, negative shrinks)
 - select subset of files
 - run in parallel with live progress
 - outputs previews to `previews/`

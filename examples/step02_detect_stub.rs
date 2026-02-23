@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use croppy::detect::{
-    BoundsNorm, DetectConfig, Detection, DetectionDebug, detect_bounds_with_debug_cfg,
+    BoundsNorm, Detection, DetectionDebug, detect_bounds_with_debug,
     draw_horizontal_profile_with_band, draw_vertical_profile_with_band,
 };
 use croppy::detect_refine::{
@@ -22,14 +22,11 @@ struct Args {
     #[arg(long, default_value = "tmp/step01/next.json")]
     input: PathBuf,
 
-    #[arg(long, default_value = "tmp/step02")]
-    out_dir: PathBuf,
+    #[arg(long)]
+    out_dir: Option<PathBuf>,
 
     #[arg(long, default_value_t = true)]
     dump_debug: bool,
-
-    #[arg(long, default_value_t = 0.22)]
-    band_margin_pct: f32,
 
     #[arg(long, default_value_t = true)]
     refine_rotation: bool,
@@ -57,7 +54,6 @@ struct Step02Result {
 
 #[derive(Debug, Serialize)]
 struct OverlayJson {
-    outer: BoundsNorm,
     inner: BoundsNorm,
     rotated_inner: Option<[[f32; 2]; 4]>,
 }
@@ -67,6 +63,10 @@ fn main() -> Result<()> {
     if !args.input.exists() {
         return Err(anyhow!("handoff json not found: {}", args.input.display()));
     }
+    let out_dir = args
+        .out_dir
+        .clone()
+        .unwrap_or_else(|| default_out_dir(&args.input));
 
     let handoff = read_handoff(&args.input)?;
     let prepared = PathBuf::from(&handoff.prepared);
@@ -74,33 +74,29 @@ fn main() -> Result<()> {
         return Err(anyhow!("prepared image missing: {}", prepared.display()));
     }
 
-    std::fs::create_dir_all(&args.out_dir)?;
+    std::fs::create_dir_all(&out_dir)?;
     let dyn_img = image::open(&prepared)?;
     let gray = dyn_img.to_luma8();
     let base_rgb = dyn_img.to_rgb8();
 
-    let cfg = DetectConfig {
-        band_margin_pct: args.band_margin_pct,
-        ..DetectConfig::default()
-    };
     let refine_cfg = RotationRefineConfig {
         refine_rotation: args.refine_rotation,
         apply_rotation_decision: args.apply_rotation_decision,
         max_refine_abs_deg: args.max_refine_abs_deg,
     };
 
-    let Some(refine) = run_detection_with_rotation_refine(&gray, cfg, refine_cfg) else {
+    let Some(refine) = run_detection_with_rotation_refine(&gray, refine_cfg) else {
         return Err(anyhow!("failed detecting boundaries"));
     };
-    let Some((_, dbg)) = detect_bounds_with_debug_cfg(&gray, cfg) else {
+    let Some((_, dbg)) = detect_bounds_with_debug(&gray) else {
         return Err(anyhow!("failed collecting debug vectors"));
     };
 
     if args.dump_debug {
-        write_debug_artifacts(&args.out_dir, &gray, &dbg)?;
+        write_debug_artifacts(&out_dir, &gray, &dbg)?;
         if let Some(d) = &refine.rotation_initial_debug {
             write_rotation_decision_artifacts(
-                &args.out_dir,
+                &out_dir,
                 &base_rgb,
                 refine.detection_initial.inner,
                 d,
@@ -114,15 +110,10 @@ fn main() -> Result<()> {
         refine.detection_initial.inner,
         Rgb([255, 255, 0]),
     );
-    let overlay_initial_path = args.out_dir.join("overlay_initial.jpg");
+    let overlay_initial_path = out_dir.join("overlay_initial.jpg");
     overlay_initial.save_with_format(&overlay_initial_path, image::ImageFormat::Jpeg)?;
 
     let mut overlay = base_rgb.clone();
-    draw_norm_rect(
-        &mut overlay,
-        refine.detection_initial.outer,
-        Rgb([255, 0, 0]),
-    );
     draw_norm_rect(
         &mut overlay,
         refine.detection_initial.inner,
@@ -137,10 +128,10 @@ fn main() -> Result<()> {
             Rgb([80, 255, 255]),
         );
     }
-    let overlay_path = args.out_dir.join("overlay.jpg");
+    let overlay_path = out_dir.join("overlay.jpg");
     overlay.save_with_format(&overlay_path, image::ImageFormat::Jpeg)?;
 
-    let overlay_cropped_path = args.out_dir.join("overlay_cropped.jpg");
+    let overlay_cropped_path = out_dir.join("overlay_cropped.jpg");
     let overlay_cropped_written = if let (Some(refined), Some(applied)) =
         (refine.detection_refined, refine.rotation_applied_deg)
     {
@@ -153,7 +144,6 @@ fn main() -> Result<()> {
         false
     };
     let overlay_json = OverlayJson {
-        outer: refine.detection_initial.outer,
         inner: refine.detection_initial.inner,
         rotated_inner: if let (Some(refined), Some(applied)) =
             (refine.detection_refined, refine.rotation_applied_deg)
@@ -168,7 +158,7 @@ fn main() -> Result<()> {
             None
         },
     };
-    let overlay_json_path = args.out_dir.join("overlay.json");
+    let overlay_json_path = out_dir.join("overlay.json");
     std::fs::write(
         &overlay_json_path,
         serde_json::to_string_pretty(&overlay_json)?,
@@ -186,7 +176,7 @@ fn main() -> Result<()> {
         rotation_applied_deg: refine.rotation_applied_deg,
         rotation_residual_deg: refine.rotation_residual_deg,
     };
-    let result_path = args.out_dir.join("result.json");
+    let result_path = out_dir.join("result.json");
     std::fs::write(&result_path, serde_json::to_string_pretty(&out)?)?;
 
     println!("step02 ok");
@@ -210,15 +200,21 @@ fn main() -> Result<()> {
         println!("rotation residual: {:.3} deg", res);
     }
     if args.dump_debug {
-        println!("debug: {}", args.out_dir.display());
-        if args.out_dir.join("rotation_decision.jpg").exists() {
+        println!("debug: {}", out_dir.display());
+        if out_dir.join("rotation_decision.jpg").exists() {
             println!(
                 "rotation decision: {}",
-                args.out_dir.join("rotation_decision.jpg").display()
+                out_dir.join("rotation_decision.jpg").display()
             );
         }
     }
     Ok(())
+}
+
+fn default_out_dir(input_handoff: &std::path::Path) -> PathBuf {
+    input_handoff
+        .parent()
+        .map_or_else(|| PathBuf::from("."), PathBuf::from)
 }
 
 fn write_debug_artifacts(
@@ -249,12 +245,7 @@ fn write_debug_artifacts(
     draw_vertical_profile_with_band(
         gray,
         dbg,
-        &[
-            dbg.outer_left_idx,
-            dbg.inner_left_idx,
-            dbg.inner_right_idx,
-            dbg.outer_right_idx,
-        ],
+        &[dbg.inner_left_idx, dbg.inner_right_idx],
         &mut vertical_plot,
     );
     vertical_plot.save_with_format(
@@ -266,12 +257,7 @@ fn write_debug_artifacts(
     draw_horizontal_profile_with_band(
         gray,
         dbg,
-        &[
-            dbg.outer_top_idx,
-            dbg.inner_top_idx,
-            dbg.inner_bottom_idx,
-            dbg.outer_bottom_idx,
-        ],
+        &[dbg.inner_top_idx, dbg.inner_bottom_idx],
         &mut horizontal_plot,
     );
     horizontal_plot.save_with_format(

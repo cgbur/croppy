@@ -1,6 +1,27 @@
 use image::{GrayImage, Rgb, RgbImage};
 use serde::Serialize;
 
+use crate::kernels::edge_scan::{self, AxisDetectConfig, EdgePolarity};
+use crate::kernels::signal_1d;
+
+// Detection requires at least this many pixels per axis to build stable
+// derivatives and edge pairs.
+const MIN_DETECT_DIM: u32 = 32;
+// Relative trim from each side when building profiles. Lower includes more
+// border noise, higher discards useful signal.
+const BAND_MARGIN_PCT: f32 = 0.22;
+const BAND_MARGIN_MIN: f32 = 0.02;
+const BAND_MARGIN_MAX: f32 = 0.45;
+// Edge scan defaults for inner-film bounds. We always expect:
+// - left/top transitions to rise
+// - right/bottom transitions to fall
+const EDGE_MAX_SIDE_FRAC: f32 = 0.48;
+const EDGE_SIDE_GUARD_FRAC: f32 = 0.02;
+const EDGE_MIN_SPAN_FRAC: f32 = 0.08;
+const EDGE_CENTER_BIAS: f32 = 0.8; // 0 = outer-facing, 1 = center-facing
+const EDGE_REL_THRESH_VERTICAL: f32 = 0.50;
+const EDGE_REL_THRESH_HORIZONTAL: f32 = 0.35;
+
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct BoundsNorm {
     pub left: f32,
@@ -11,22 +32,8 @@ pub struct BoundsNorm {
 
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct Detection {
-    pub outer: BoundsNorm,
     pub inner: BoundsNorm,
     pub confidence: f32,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct DetectConfig {
-    pub band_margin_pct: f32,
-}
-
-impl Default for DetectConfig {
-    fn default() -> Self {
-        Self {
-            band_margin_pct: 0.22,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -37,10 +44,6 @@ pub struct DetectionDebug {
     pub horizontal_profile: Vec<f32>,
     pub vertical_derivative: Vec<f32>,
     pub horizontal_derivative: Vec<f32>,
-    pub outer_left_idx: usize,
-    pub outer_right_idx: usize,
-    pub outer_top_idx: usize,
-    pub outer_bottom_idx: usize,
     pub inner_left_idx: usize,
     pub inner_right_idx: usize,
     pub inner_top_idx: usize,
@@ -63,95 +66,57 @@ pub struct RotationEstimate {
 /// Detects film bounds from a preprocessed grayscale image.
 ///
 /// Method: build smoothed 1D brightness profiles (vertical/horizontal), take
-/// signed first derivatives, find outer edges by expected polarity near image
-/// borders, then search inward for inner edges with expected polarity. Returns
-/// normalized outer/inner rectangles and confidence from edge strength.
+/// signed first derivatives, then detect one polarity-constrained inner edge
+/// pair on each axis. Returns normalized inner rectangle and confidence from
+/// edge strength.
 pub fn detect_bounds(gray: &GrayImage) -> Option<Detection> {
     detect_bounds_with_debug(gray).map(|(d, _)| d)
 }
 
 pub fn detect_bounds_with_debug(gray: &GrayImage) -> Option<(Detection, DetectionDebug)> {
-    detect_bounds_with_debug_cfg(gray, DetectConfig::default())
-}
-
-pub fn detect_bounds_with_debug_cfg(
-    gray: &GrayImage,
-    cfg: DetectConfig,
-) -> Option<(Detection, DetectionDebug)> {
     let (w, h) = gray.dimensions();
-    if w < 32 || h < 32 {
+    if w < MIN_DETECT_DIM || h < MIN_DETECT_DIM {
         return None;
     }
 
-    let m = cfg.band_margin_pct.clamp(0.02, 0.45);
+    let m = BAND_MARGIN_PCT.clamp(BAND_MARGIN_MIN, BAND_MARGIN_MAX);
     let y0 = ((h as f32) * m).round() as u32;
     let y1 = ((h as f32) * (1.0 - m)).round() as u32;
     let x0 = ((w as f32) * m).round() as u32;
     let x1 = ((w as f32) * (1.0 - m)).round() as u32;
     // Vertical profile is indexed by x and is used to detect left/right edges.
-    let vertical_profile = smooth(&profile_vertical_ranges(gray, &[(y0, y1)]), 3);
+    let vertical_profile =
+        signal_1d::smooth_boxcar(&signal_1d::profile_vertical_ranges(gray, &[(y0, y1)]), 3);
     // Horizontal profile is indexed by y and is used to detect top/bottom edges.
     // Keep a bit more detail on horizontal transitions.
-    let horizontal_profile = smooth(&profile_horizontal_ranges(gray, &[(x0, x1)]), 2);
+    let horizontal_profile =
+        signal_1d::smooth_boxcar(&signal_1d::profile_horizontal_ranges(gray, &[(x0, x1)]), 2);
 
-    let vertical_derivative = signed_derivative(&vertical_profile);
-    let horizontal_derivative = signed_derivative(&horizontal_profile);
+    let vertical_derivative = signal_1d::signed_derivative(&vertical_profile);
+    let horizontal_derivative = signal_1d::signed_derivative(&horizontal_profile);
 
-    let center_bias = 0.8; // 0 = outer-facing edge of hump, 1 = center-facing edge
-    let outer_hump_rel = 0.25;
-    let vertical_edges = detect_axis_edges(
+    let vertical_edges = edge_scan::detect_axis_edges(
         &vertical_derivative,
         w as usize,
-        AxisDetectConfig {
-            max_outer_frac: 0.35,
-            min_gap_frac: 0.005,
-            max_gap_frac: 0.25,
-            inner_rel_thresh: 0.50,
-            center_bias,
-            outer_hump_rel,
-            outer_start_polarity: EdgePolarity::Falling,
-            outer_end_polarity: EdgePolarity::Rising,
-            inner_start_polarity: EdgePolarity::Rising,
-            inner_end_polarity: EdgePolarity::Falling,
-        },
+        inner_axis_config(EDGE_REL_THRESH_VERTICAL),
     )?;
-    let horizontal_edges = detect_axis_edges(
+    let horizontal_edges = edge_scan::detect_axis_edges(
         &horizontal_derivative,
         h as usize,
-        AxisDetectConfig {
-            max_outer_frac: 0.35,
-            min_gap_frac: 0.005,
-            max_gap_frac: 0.25,
-            inner_rel_thresh: 0.35,
-            center_bias,
-            outer_hump_rel,
-            outer_start_polarity: EdgePolarity::Falling,
-            outer_end_polarity: EdgePolarity::Rising,
-            inner_start_polarity: EdgePolarity::Rising,
-            inner_end_polarity: EdgePolarity::Falling,
-        },
+        inner_axis_config(EDGE_REL_THRESH_HORIZONTAL),
     )?;
 
-    let outer_l = vertical_edges.outer_start;
-    let outer_r = vertical_edges.outer_end;
-    let outer_t = horizontal_edges.outer_start;
-    let outer_b = horizontal_edges.outer_end;
-    let inner_l = vertical_edges.inner_start;
-    let inner_r = vertical_edges.inner_end;
-    let inner_t = horizontal_edges.inner_start;
-    let inner_b = horizontal_edges.inner_end;
+    let inner_l = vertical_edges.start;
+    let inner_r = vertical_edges.end;
+    let inner_t = horizontal_edges.start;
+    let inner_b = horizontal_edges.end;
 
-    let score_outer = vertical_edges.score_outer.min(horizontal_edges.score_outer);
-    let score_inner = vertical_edges.score_inner.min(horizontal_edges.score_inner);
-    let confidence = ((score_outer + score_inner) * 0.5).clamp(0.0, 1.0);
+    let confidence = vertical_edges
+        .score
+        .min(horizontal_edges.score)
+        .clamp(0.0, 1.0);
 
     let detection = Detection {
-        outer: BoundsNorm {
-            left: outer_l as f32 / w as f32,
-            top: outer_t as f32 / h as f32,
-            right: outer_r as f32 / w as f32,
-            bottom: outer_b as f32 / h as f32,
-        },
         inner: BoundsNorm {
             left: inner_l as f32 / w as f32,
             top: inner_t as f32 / h as f32,
@@ -167,10 +132,6 @@ pub fn detect_bounds_with_debug_cfg(
         horizontal_profile,
         vertical_derivative,
         horizontal_derivative,
-        outer_left_idx: outer_l,
-        outer_right_idx: outer_r,
-        outer_top_idx: outer_t,
-        outer_bottom_idx: outer_b,
         inner_left_idx: inner_l,
         inner_right_idx: inner_r,
         inner_top_idx: inner_t,
@@ -184,138 +145,20 @@ pub fn detect_bounds_with_debug_cfg(
     Some((detection, debug))
 }
 
-#[derive(Debug, Clone, Copy)]
-enum EdgePolarity {
-    Rising,
-    Falling,
-}
-
-impl EdgePolarity {
-    fn response(self, derivative_value: f32) -> f32 {
-        match self {
-            EdgePolarity::Rising => derivative_value.max(0.0),
-            EdgePolarity::Falling => (-derivative_value).max(0.0),
-        }
+fn inner_axis_config(rel_thresh: f32) -> AxisDetectConfig {
+    AxisDetectConfig {
+        max_side_frac: EDGE_MAX_SIDE_FRAC,
+        side_guard_frac: EDGE_SIDE_GUARD_FRAC,
+        min_span_frac: EDGE_MIN_SPAN_FRAC,
+        rel_thresh,
+        center_bias: EDGE_CENTER_BIAS,
+        start_polarity: EdgePolarity::Rising,
+        end_polarity: EdgePolarity::Falling,
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct AxisDetectConfig {
-    max_outer_frac: f32,
-    min_gap_frac: f32,
-    max_gap_frac: f32,
-    inner_rel_thresh: f32,
-    center_bias: f32,
-    outer_hump_rel: f32,
-    outer_start_polarity: EdgePolarity,
-    outer_end_polarity: EdgePolarity,
-    inner_start_polarity: EdgePolarity,
-    inner_end_polarity: EdgePolarity,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct AxisEdges {
-    outer_start: usize,
-    outer_end: usize,
-    inner_start: usize,
-    inner_end: usize,
-    score_outer: f32,
-    score_inner: f32,
-}
-
-fn detect_axis_edges(
-    derivative: &[f32],
-    axis_len: usize,
-    cfg: AxisDetectConfig,
-) -> Option<AxisEdges> {
-    let max_outer = ((axis_len as f32) * cfg.max_outer_frac).max(4.0) as usize;
-    let outer_start = peak_idx_polarity(derivative, 2, max_outer, cfg.outer_start_polarity)?;
-    let outer_end = mirror_peak_idx_polarity(derivative, 2, max_outer, cfg.outer_end_polarity)?;
-
-    if outer_start + 8 >= outer_end {
-        return None;
-    }
-
-    let min_gap = ((axis_len as f32) * cfg.min_gap_frac).max(2.0) as usize;
-    let max_gap = ((axis_len as f32) * cfg.max_gap_frac).max((min_gap + 1) as f32) as usize;
-    let outer_start_hump = hump_run_bounds_polarity(
-        derivative,
-        outer_start,
-        cfg.outer_hump_rel,
-        cfg.outer_start_polarity,
-    );
-    let outer_end_hump = hump_run_bounds_polarity(
-        derivative,
-        outer_end,
-        cfg.outer_hump_rel,
-        cfg.outer_end_polarity,
-    );
-    let avoid_pad = min_gap.max(3);
-
-    let inner_start_search_start = outer_start
-        .saturating_add(min_gap)
-        .max(outer_start_hump.1.saturating_add(avoid_pad));
-    let inner_end_search_end = outer_end
-        .saturating_sub(min_gap)
-        .min(outer_end_hump.0.saturating_sub(avoid_pad));
-
-    let inner_start = first_strong_hump_polarity(
-        derivative,
-        HumpSearchSpec {
-            start: inner_start_search_start,
-            end: outer_start.saturating_add(max_gap),
-            rel_thresh: cfg.inner_rel_thresh,
-            center_bias: cfg.center_bias,
-            avoid: Some(outer_start_hump),
-            dir: ScanDir::Forward,
-            polarity: cfg.inner_start_polarity,
-        },
-    )
-    .unwrap_or(outer_start);
-    let inner_end = first_strong_hump_polarity(
-        derivative,
-        HumpSearchSpec {
-            start: outer_end.saturating_sub(max_gap),
-            end: inner_end_search_end,
-            rel_thresh: cfg.inner_rel_thresh,
-            center_bias: cfg.center_bias,
-            avoid: Some(outer_end_hump),
-            dir: ScanDir::Backward,
-            polarity: cfg.inner_end_polarity,
-        },
-    )
-    .unwrap_or(outer_end);
-
-    if inner_start + 8 >= inner_end {
-        return None;
-    }
-
-    let score_outer = side_score_polarity(derivative, outer_start, cfg.outer_start_polarity).min(
-        side_score_polarity(derivative, outer_end, cfg.outer_end_polarity),
-    );
-    let score_inner = side_score_polarity(derivative, inner_start, cfg.inner_start_polarity).min(
-        side_score_polarity(derivative, inner_end, cfg.inner_end_polarity),
-    );
-
-    Some(AxisEdges {
-        outer_start,
-        outer_end,
-        inner_start,
-        inner_end,
-        score_outer,
-        score_inner,
-    })
 }
 
 pub fn draw_detection_overlay(img: &mut RgbImage, det: Detection) {
     let (w, h) = img.dimensions();
-    draw_norm_rect(
-        img,
-        det.outer,
-        Rgb([255, 0, 0]), // red = outer
-        w,
-        h,
-    );
     draw_norm_rect(
         img,
         det.inner,
@@ -327,7 +170,7 @@ pub fn draw_detection_overlay(img: &mut RgbImage, det: Detection) {
 
 pub fn estimate_rotation_from_inner(gray: &GrayImage, det: Detection) -> Option<RotationEstimate> {
     let (w, h) = gray.dimensions();
-    if w < 32 || h < 32 {
+    if w < MIN_DETECT_DIM || h < MIN_DETECT_DIM {
         return None;
     }
     let x1 = ((det.inner.left * w as f32).round() as i32).clamp(0, (w - 1) as i32) as u32;
@@ -401,249 +244,6 @@ fn draw_rect(img: &mut RgbImage, x1: u32, y1: u32, x2: u32, y2: u32, color: Rgb<
         *img.get_pixel_mut(xa, y) = color;
         *img.get_pixel_mut(xb, y) = color;
     }
-}
-
-fn profile_vertical_ranges(gray: &GrayImage, y_ranges: &[(u32, u32)]) -> Vec<f32> {
-    let (w, _) = gray.dimensions();
-    (0..w)
-        .map(|x| {
-            let mut sum = 0.0f32;
-            let mut n = 0u32;
-            for (y0, y1) in y_ranges {
-                for y in *y0..=*y1 {
-                    sum += gray.get_pixel(x, y)[0] as f32;
-                    n += 1;
-                }
-            }
-            if n == 0 { 0.0 } else { sum / n as f32 }
-        })
-        .collect()
-}
-
-fn profile_horizontal_ranges(gray: &GrayImage, x_ranges: &[(u32, u32)]) -> Vec<f32> {
-    let (_, h) = gray.dimensions();
-    (0..h)
-        .map(|y| {
-            let mut sum = 0.0f32;
-            let mut n = 0u32;
-            for (x0, x1) in x_ranges {
-                for x in *x0..=*x1 {
-                    sum += gray.get_pixel(x, y)[0] as f32;
-                    n += 1;
-                }
-            }
-            if n == 0 { 0.0 } else { sum / n as f32 }
-        })
-        .collect()
-}
-
-fn smooth(v: &[f32], radius: usize) -> Vec<f32> {
-    if v.is_empty() || radius == 0 {
-        return v.to_vec();
-    }
-    let mut out = vec![0.0f32; v.len()];
-    for (i, outv) in out.iter_mut().enumerate() {
-        let a = i.saturating_sub(radius);
-        let b = (i + radius).min(v.len() - 1);
-        let mut sum = 0.0f32;
-        let mut n = 0usize;
-        for val in v.iter().take(b + 1).skip(a) {
-            sum += *val;
-            n += 1;
-        }
-        *outv = if n == 0 { 0.0 } else { sum / n as f32 };
-    }
-    out
-}
-
-fn signed_derivative(v: &[f32]) -> Vec<f32> {
-    if v.len() < 2 {
-        return vec![];
-    }
-    let mut out = vec![0.0f32; v.len()];
-    for i in 1..v.len() {
-        out[i] = v[i] - v[i - 1];
-    }
-    out
-}
-
-fn peak_idx_polarity(
-    derivative: &[f32],
-    start: usize,
-    end: usize,
-    polarity: EdgePolarity,
-) -> Option<usize> {
-    if derivative.is_empty() {
-        return None;
-    }
-    let s = start.min(derivative.len() - 1);
-    let e = end.min(derivative.len() - 1);
-    if s >= e {
-        return None;
-    }
-    let mut best_i = s;
-    let mut best_v = f32::NEG_INFINITY;
-    for (i, val) in derivative.iter().enumerate().take(e + 1).skip(s) {
-        let resp = polarity.response(*val);
-        if resp > best_v {
-            best_v = resp;
-            best_i = i;
-        }
-    }
-    Some(best_i)
-}
-
-fn mirror_peak_idx_polarity(
-    derivative: &[f32],
-    start_from_right: usize,
-    end_from_right: usize,
-    polarity: EdgePolarity,
-) -> Option<usize> {
-    if derivative.is_empty() {
-        return None;
-    }
-    let n = derivative.len();
-    let s = n.saturating_sub(1 + end_from_right.min(n - 1));
-    let e = n.saturating_sub(1 + start_from_right.min(n - 1));
-    peak_idx_polarity(derivative, s, e, polarity)
-}
-
-fn side_score_polarity(derivative: &[f32], idx: usize, polarity: EdgePolarity) -> f32 {
-    if derivative.is_empty() || idx >= derivative.len() {
-        return 0.0;
-    }
-    let mut s: Vec<f32> = derivative.iter().map(|v| polarity.response(*v)).collect();
-    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let p95_idx = ((s.len() - 1) as f32 * 0.95).round() as usize;
-    let p95 = s[p95_idx].max(1e-6);
-    (polarity.response(derivative[idx]) / p95).clamp(0.0, 1.0)
-}
-
-#[derive(Clone, Copy)]
-enum ScanDir {
-    Forward,
-    Backward,
-}
-
-#[derive(Clone, Copy)]
-struct HumpSearchSpec {
-    start: usize,
-    end: usize,
-    rel_thresh: f32,
-    center_bias: f32,
-    avoid: Option<(usize, usize)>,
-    dir: ScanDir,
-    polarity: EdgePolarity,
-}
-
-fn first_strong_hump_polarity(derivative: &[f32], spec: HumpSearchSpec) -> Option<usize> {
-    if derivative.len() < 3 {
-        return None;
-    }
-    let s = spec.start.max(1).min(derivative.len() - 2);
-    let e = spec.end.min(derivative.len() - 2);
-    if s > e {
-        return None;
-    }
-
-    let max_v = derivative[s..=e]
-        .iter()
-        .map(|v| spec.polarity.response(*v))
-        .fold(0.0f32, f32::max);
-    let threshold = max_v * spec.rel_thresh.clamp(0.0, 1.0);
-    let b = spec.center_bias.clamp(0.0, 1.0);
-    match spec.dir {
-        ScanDir::Forward => {
-            let mut i = s;
-            while i <= e {
-                if spec.polarity.response(derivative[i]) >= threshold {
-                    let run_start = i;
-                    let mut run_end = i;
-                    while run_end < e
-                        && spec.polarity.response(derivative[run_end + 1]) >= threshold
-                    {
-                        run_end += 1;
-                    }
-                    if overlaps_avoid(run_start, run_end, spec.avoid) {
-                        i = run_end.saturating_add(1);
-                        continue;
-                    }
-                    return Some(pick_from_run(run_start, run_end, b, spec.dir));
-                }
-                i += 1;
-            }
-        }
-        ScanDir::Backward => {
-            let mut i = e;
-            loop {
-                if spec.polarity.response(derivative[i]) >= threshold {
-                    let run_end = i;
-                    let mut run_start = i;
-                    while run_start > s
-                        && spec.polarity.response(derivative[run_start - 1]) >= threshold
-                    {
-                        run_start -= 1;
-                    }
-                    if overlaps_avoid(run_start, run_end, spec.avoid) {
-                        if run_start == s {
-                            break;
-                        }
-                        i = run_start.saturating_sub(1);
-                        continue;
-                    }
-                    return Some(pick_from_run(run_start, run_end, b, spec.dir));
-                }
-                if i == s {
-                    break;
-                }
-                i -= 1;
-            }
-        }
-    }
-
-    peak_idx_polarity(derivative, s, e, spec.polarity)
-}
-
-fn overlaps_avoid(run_start: usize, run_end: usize, avoid: Option<(usize, usize)>) -> bool {
-    let Some((a, b)) = avoid else {
-        return false;
-    };
-    let lo = a.min(b);
-    let hi = a.max(b);
-    run_end >= lo && run_start <= hi
-}
-
-fn pick_from_run(run_start: usize, run_end: usize, center_bias: f32, dir: ScanDir) -> usize {
-    let span = run_end.saturating_sub(run_start);
-    let offset = ((span as f32) * center_bias.clamp(0.0, 1.0)).round() as usize;
-    match dir {
-        ScanDir::Forward => (run_start + offset).min(run_end),
-        ScanDir::Backward => run_end.saturating_sub(offset).max(run_start),
-    }
-}
-
-fn hump_run_bounds_polarity(
-    derivative: &[f32],
-    idx: usize,
-    rel_thresh: f32,
-    polarity: EdgePolarity,
-) -> (usize, usize) {
-    if derivative.is_empty() {
-        return (0, 0);
-    }
-    let i = idx.min(derivative.len() - 1);
-    let peak = polarity.response(derivative[i]).max(1e-6);
-    let threshold = peak * rel_thresh.clamp(0.0, 1.0);
-
-    let mut lo = i;
-    while lo > 0 && polarity.response(derivative[lo - 1]) >= threshold {
-        lo -= 1;
-    }
-    let mut hi = i;
-    while hi + 1 < derivative.len() && polarity.response(derivative[hi + 1]) >= threshold {
-        hi += 1;
-    }
-    (lo, hi)
 }
 
 pub fn draw_profile_plot(
