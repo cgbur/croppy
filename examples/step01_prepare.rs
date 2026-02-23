@@ -7,7 +7,7 @@ use clap::Parser;
 use croppy::discover::{is_supported_raw, list_raw_files};
 use croppy::handoff::{Step01Handoff, Step01Transform, write_handoff};
 use croppy::preprocess::{PreprocessConfig, prepare_image, resize_rgb_max_edge};
-use croppy::raw::{decode_raw_to_rgb, rgb_to_gray};
+use croppy::raw::{decode_raw_to_rgb_with_hint, rgb_to_gray};
 use image::ImageFormat;
 use rand::prelude::IndexedRandom;
 
@@ -73,8 +73,13 @@ fn main() -> Result<()> {
 
     println!("selected raw: {}", selected.display());
     let t_decode = Instant::now();
-    let rgb_full = decode_raw_to_rgb(&selected)?;
+    let decoded = decode_raw_to_rgb_with_hint(&selected, args.max_edge)?;
     let dt_decode = t_decode.elapsed();
+    println!("decode source: {}", decoded.source.label());
+    if let Some(warning) = decoded.warning {
+        eprintln!("warning: {warning}");
+    }
+    let rgb_full = decoded.image;
     let (raw_w, raw_h) = rgb_full.dimensions();
     let t_resize = Instant::now();
     let rgb = resize_rgb_max_edge(&rgb_full, args.max_edge);
@@ -148,7 +153,10 @@ fn main() -> Result<()> {
     println!("wrote prepared: {}", prepared_path.display());
     println!("wrote handoff: {}", handoff_path.display());
     println!("timing: select_raw = {} ms", dt_select.as_millis());
-    println!("timing: decode_raw_to_rgb = {} ms", dt_decode.as_millis());
+    println!(
+        "timing: decode_raw_to_rgb_with_hint = {} ms",
+        dt_decode.as_millis()
+    );
     println!("timing: resize_rgb_max_edge = {} ms", dt_resize.as_millis());
     println!(
         "timing: grayscale+prepare_image = {} ms",
