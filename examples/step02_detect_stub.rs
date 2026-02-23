@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use clap::Parser;
@@ -58,7 +59,24 @@ struct OverlayJson {
     rotated_inner: Option<[[f32; 2]; 4]>,
 }
 
+#[derive(Debug, Serialize)]
+struct Step02Timing {
+    handoff_read_ms: u128,
+    image_open_ms: u128,
+    detect_refine_ms: u128,
+    detect_debug_ms: u128,
+    write_debug_ms: u128,
+    write_rotation_debug_ms: u128,
+    write_overlay_initial_ms: u128,
+    write_overlay_ms: u128,
+    write_overlay_cropped_ms: u128,
+    write_overlay_json_ms: u128,
+    write_result_ms: u128,
+    total_ms: u128,
+}
+
 fn main() -> Result<()> {
+    let t_total = Instant::now();
     let args = Args::parse();
     if !args.input.exists() {
         return Err(anyhow!("handoff json not found: {}", args.input.display()));
@@ -68,16 +86,20 @@ fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| default_out_dir(&args.input));
 
+    let t_handoff = Instant::now();
     let handoff = read_handoff(&args.input)?;
+    let dt_handoff = t_handoff.elapsed();
     let prepared = PathBuf::from(&handoff.prepared);
     if !prepared.exists() {
         return Err(anyhow!("prepared image missing: {}", prepared.display()));
     }
 
     std::fs::create_dir_all(&out_dir)?;
+    let t_open = Instant::now();
     let dyn_img = image::open(&prepared)?;
     let gray = dyn_img.to_luma8();
     let base_rgb = dyn_img.to_rgb8();
+    let dt_open = t_open.elapsed();
 
     let refine_cfg = RotationRefineConfig {
         refine_rotation: args.refine_rotation,
@@ -85,22 +107,33 @@ fn main() -> Result<()> {
         max_refine_abs_deg: args.max_refine_abs_deg,
     };
 
+    let t_detect_refine = Instant::now();
     let Some(refine) = run_detection_with_rotation_refine(&gray, refine_cfg) else {
         return Err(anyhow!("failed detecting boundaries"));
     };
+    let dt_detect_refine = t_detect_refine.elapsed();
+    let t_detect_debug = Instant::now();
     let Some((_, dbg)) = detect_bounds_with_debug(&gray) else {
         return Err(anyhow!("failed collecting debug vectors"));
     };
+    let dt_detect_debug = t_detect_debug.elapsed();
+
+    let mut dt_write_debug = Duration::default();
+    let mut dt_write_rotation_debug = Duration::default();
 
     if args.dump_debug {
+        let t_write_debug = Instant::now();
         write_debug_artifacts(&out_dir, &gray, &dbg)?;
+        dt_write_debug = t_write_debug.elapsed();
         if let Some(d) = &refine.rotation_initial_debug {
+            let t_write_rotation_debug = Instant::now();
             write_rotation_decision_artifacts(
                 &out_dir,
                 &base_rgb,
                 refine.detection_initial.inner,
                 d,
             )?;
+            dt_write_rotation_debug = t_write_rotation_debug.elapsed();
         }
     }
 
@@ -111,7 +144,9 @@ fn main() -> Result<()> {
         Rgb([255, 255, 0]),
     );
     let overlay_initial_path = out_dir.join("overlay_initial.jpg");
+    let t_overlay_initial = Instant::now();
     overlay_initial.save_with_format(&overlay_initial_path, image::ImageFormat::Jpeg)?;
+    let dt_overlay_initial = t_overlay_initial.elapsed();
 
     let mut overlay = base_rgb.clone();
     draw_norm_rect(
@@ -129,9 +164,12 @@ fn main() -> Result<()> {
         );
     }
     let overlay_path = out_dir.join("overlay.jpg");
+    let t_overlay = Instant::now();
     overlay.save_with_format(&overlay_path, image::ImageFormat::Jpeg)?;
+    let dt_overlay = t_overlay.elapsed();
 
     let overlay_cropped_path = out_dir.join("overlay_cropped.jpg");
+    let t_overlay_cropped = Instant::now();
     let overlay_cropped_written = if let (Some(refined), Some(applied)) =
         (refine.detection_refined, refine.rotation_applied_deg)
     {
@@ -143,6 +181,7 @@ fn main() -> Result<()> {
         let _ = std::fs::remove_file(&overlay_cropped_path);
         false
     };
+    let dt_overlay_cropped = t_overlay_cropped.elapsed();
     let overlay_json = OverlayJson {
         inner: refine.detection_initial.inner,
         rotated_inner: if let (Some(refined), Some(applied)) =
@@ -159,10 +198,12 @@ fn main() -> Result<()> {
         },
     };
     let overlay_json_path = out_dir.join("overlay.json");
+    let t_overlay_json = Instant::now();
     std::fs::write(
         &overlay_json_path,
         serde_json::to_string_pretty(&overlay_json)?,
     )?;
+    let dt_overlay_json = t_overlay_json.elapsed();
 
     let out = Step02Result {
         raw: handoff.raw,
@@ -177,7 +218,26 @@ fn main() -> Result<()> {
         rotation_residual_deg: refine.rotation_residual_deg,
     };
     let result_path = out_dir.join("result.json");
+    let t_result = Instant::now();
     std::fs::write(&result_path, serde_json::to_string_pretty(&out)?)?;
+    let dt_result = t_result.elapsed();
+
+    let timing = Step02Timing {
+        handoff_read_ms: dt_handoff.as_millis(),
+        image_open_ms: dt_open.as_millis(),
+        detect_refine_ms: dt_detect_refine.as_millis(),
+        detect_debug_ms: dt_detect_debug.as_millis(),
+        write_debug_ms: dt_write_debug.as_millis(),
+        write_rotation_debug_ms: dt_write_rotation_debug.as_millis(),
+        write_overlay_initial_ms: dt_overlay_initial.as_millis(),
+        write_overlay_ms: dt_overlay.as_millis(),
+        write_overlay_cropped_ms: dt_overlay_cropped.as_millis(),
+        write_overlay_json_ms: dt_overlay_json.as_millis(),
+        write_result_ms: dt_result.as_millis(),
+        total_ms: t_total.elapsed().as_millis(),
+    };
+    let timing_path = out_dir.join("timing.json");
+    std::fs::write(&timing_path, serde_json::to_string_pretty(&timing)?)?;
 
     println!("step02 ok");
     println!("overlay initial: {}", overlay_initial_path.display());
@@ -187,6 +247,7 @@ fn main() -> Result<()> {
     }
     println!("overlay json: {}", overlay_json_path.display());
     println!("result: {}", result_path.display());
+    println!("timing json: {}", timing_path.display());
     if let Some(est) = refine.rotation_estimate {
         println!(
             "rotation estimate: {:.3} deg (t={:?} b={:?} l={:?} r={:?})",
@@ -208,6 +269,30 @@ fn main() -> Result<()> {
             );
         }
     }
+    println!("timing: handoff_read = {} ms", timing.handoff_read_ms);
+    println!("timing: image_open = {} ms", timing.image_open_ms);
+    println!("timing: detect_refine = {} ms", timing.detect_refine_ms);
+    println!("timing: detect_debug = {} ms", timing.detect_debug_ms);
+    println!("timing: write_debug = {} ms", timing.write_debug_ms);
+    println!(
+        "timing: write_rotation_debug = {} ms",
+        timing.write_rotation_debug_ms
+    );
+    println!(
+        "timing: write_overlay_initial = {} ms",
+        timing.write_overlay_initial_ms
+    );
+    println!("timing: write_overlay = {} ms", timing.write_overlay_ms);
+    println!(
+        "timing: write_overlay_cropped = {} ms",
+        timing.write_overlay_cropped_ms
+    );
+    println!(
+        "timing: write_overlay_json = {} ms",
+        timing.write_overlay_json_ms
+    );
+    println!("timing: write_result = {} ms", timing.write_result_ms);
+    println!("timing: total_step02 = {} ms", timing.total_ms);
     Ok(())
 }
 

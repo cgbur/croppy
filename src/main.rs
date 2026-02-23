@@ -18,7 +18,7 @@ use croppy::detect_refine::{
 };
 use croppy::discover::{is_supported_raw, list_raw_files};
 use croppy::preprocess::{PreprocessConfig, prepare_image, resize_rgb_max_edge};
-use croppy::raw::{decode_raw_bytes_to_rgb, rgb_to_gray};
+use croppy::raw::{decode_raw_to_rgb_with_hint, rgb_to_gray};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -89,39 +89,84 @@ struct FileResult {
     error: Option<String>,
 }
 
-struct RawBytesJob {
+struct RawJob {
     raw: PathBuf,
-    bytes: Vec<u8>,
 }
 
 struct PipelineStats {
+    pending_count: AtomicUsize,
+    reading_count: AtomicUsize,
+    reading_peak: AtomicUsize,
+    processing_count: AtomicUsize,
+    processing_peak: AtomicUsize,
     buffered_count: AtomicUsize,
     buffered_peak: AtomicUsize,
     buffered_capacity: usize,
+    read_workers: usize,
+    process_workers: usize,
 }
 
 impl PipelineStats {
-    fn new(buffered_capacity: usize) -> Self {
+    fn new(
+        pending_paths: usize,
+        buffered_capacity: usize,
+        read_workers: usize,
+        process_workers: usize,
+    ) -> Self {
         Self {
+            pending_count: AtomicUsize::new(pending_paths),
+            reading_count: AtomicUsize::new(0),
+            reading_peak: AtomicUsize::new(0),
+            processing_count: AtomicUsize::new(0),
+            processing_peak: AtomicUsize::new(0),
             buffered_count: AtomicUsize::new(0),
             buffered_peak: AtomicUsize::new(0),
             buffered_capacity,
+            read_workers,
+            process_workers,
         }
     }
 
+    fn mark_path_taken(&self) {
+        Self::dec_counter(&self.pending_count);
+    }
+
+    fn start_reading(&self) {
+        Self::inc_with_peak(&self.reading_count, &self.reading_peak);
+    }
+
+    fn finish_reading(&self) {
+        Self::dec_counter(&self.reading_count);
+    }
+
+    fn start_processing(&self) {
+        Self::inc_with_peak(&self.processing_count, &self.processing_peak);
+    }
+
+    fn finish_processing(&self) {
+        Self::dec_counter(&self.processing_count);
+    }
+
     fn inc_buffered(&self) {
-        let next = self.buffered_count.fetch_add(1, Ordering::Relaxed) + 1;
-        self.buffered_peak.fetch_max(next, Ordering::Relaxed);
+        Self::inc_with_peak(&self.buffered_count, &self.buffered_peak);
     }
 
     fn dec_buffered(&self) {
+        Self::dec_counter(&self.buffered_count);
+    }
+
+    fn inc_with_peak(count: &AtomicUsize, peak: &AtomicUsize) {
+        let next = count.fetch_add(1, Ordering::Relaxed) + 1;
+        peak.fetch_max(next, Ordering::Relaxed);
+    }
+
+    fn dec_counter(count: &AtomicUsize) {
         loop {
-            let cur = self.buffered_count.load(Ordering::Relaxed);
+            let cur = count.load(Ordering::Relaxed);
             if cur == 0 {
                 break;
             }
-            if self
-                .buffered_count
+            if count
                 .compare_exchange(cur, cur - 1, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
             {
@@ -496,9 +541,9 @@ fn draw_running(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, app: &A
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(6),
-            Constraint::Length(6),
-            Constraint::Length(4),
+            Constraint::Length(8),
+            Constraint::Length(5),
+            Constraint::Length(3),
         ])
         .split(inner_area(area));
     let (ok_count, failed_count, canceled_count) = summarize_results(&app.results);
@@ -527,22 +572,34 @@ fn draw_running(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, app: &A
         .run_started_at
         .map(|t| format_duration(t.elapsed()))
         .unwrap_or_else(|| "0s".to_string());
-    let buffered_line = if let Some(stats) = &app.pipeline_stats {
+    let (pipeline_line, workers_line) = if let Some(stats) = &app.pipeline_stats {
+        let pending = stats.pending_count.load(Ordering::Relaxed);
         let buffered = stats.buffered_count.load(Ordering::Relaxed);
-        let peak = stats.buffered_peak.load(Ordering::Relaxed);
-        format!(
-            "Buffered: {buffered}/{} (peak {peak})",
-            stats.buffered_capacity
+        let buffered_peak = stats.buffered_peak.load(Ordering::Relaxed);
+        let reading = stats.reading_count.load(Ordering::Relaxed);
+        let reading_peak = stats.reading_peak.load(Ordering::Relaxed);
+        let processing = stats.processing_count.load(Ordering::Relaxed);
+        let processing_peak = stats.processing_peak.load(Ordering::Relaxed);
+        (
+            format!(
+                "Pipeline: pending {pending} | buffered {buffered}/{} (peak {buffered_peak})",
+                stats.buffered_capacity
+            ),
+            format!(
+                "Workers: read {reading}/{} (peak {reading_peak}) | process {processing}/{} (peak {processing_peak})",
+                stats.read_workers, stats.process_workers
+            ),
         )
     } else {
-        "Buffered: -".to_string()
+        ("Pipeline: -".to_string(), "Workers: -".to_string())
     };
     let current = Paragraph::new(vec![
         Line::from(format!("Elapsed: {elapsed}")),
         Line::from(format!(
             "Done: {ok_count} ok  {failed_count} failed  {canceled_count} canceled"
         )),
-        Line::from(buffered_line),
+        Line::from(pipeline_line),
+        Line::from(workers_line),
         Line::from(vec![
             Span::styled("Current: ", Style::default().fg(Color::Gray)),
             Span::styled(
@@ -825,17 +882,22 @@ fn spawn_worker(
     let cores = thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
+    // Keep a meaningful reader stage on high-core systems so processors are not starved.
+    let read_workers = (cores / 3).clamp(2, 8);
+    let process_workers = cores.saturating_sub(read_workers).max(2);
     let buffered_jobs = cores.max(1);
-    let stats = Arc::new(PipelineStats::new(buffered_jobs));
+    let stats = Arc::new(PipelineStats::new(
+        files.len(),
+        buffered_jobs,
+        read_workers,
+        process_workers,
+    ));
     let stats_for_worker = Arc::clone(&stats);
     thread::spawn(move || {
-        // Keep a meaningful reader stage on high-core systems so processors are not starved.
-        let read_workers = (cores / 3).clamp(2, 8);
-        let process_workers = cores.saturating_sub(read_workers).max(2);
         let buffered_jobs = stats_for_worker.buffered_capacity;
 
         let queue = Arc::new(Mutex::new(VecDeque::from(files)));
-        let (raw_tx, raw_rx) = mpsc::sync_channel::<RawBytesJob>(buffered_jobs);
+        let (raw_tx, raw_rx) = mpsc::sync_channel::<RawJob>(buffered_jobs);
         let shared_raw_rx = Arc::new(Mutex::new(raw_rx));
 
         let mut process_handles = Vec::with_capacity(process_workers);
@@ -855,7 +917,9 @@ fn spawn_worker(
                         break;
                     };
                     stats_cloned.dec_buffered();
-                    let res = process_raw_bytes_job(job, &opts_cloned, &tx_cloned, &cancel_cloned);
+                    stats_cloned.start_processing();
+                    let res = process_raw_job(job, &opts_cloned, &tx_cloned, &cancel_cloned);
+                    stats_cloned.finish_processing();
                     let _ = tx_cloned.send(WorkerMsg::Finished(res));
                 }
             }));
@@ -877,34 +941,21 @@ fn spawn_worker(
                     let Some(raw) = maybe_raw else {
                         break;
                     };
+                    stats_cloned.mark_path_taken();
 
                     if cancel_cloned.load(Ordering::Relaxed) {
                         let _ = tx_cloned.send(WorkerMsg::Finished(canceled_result()));
                         continue;
                     }
 
-                    let _ = tx_cloned.send(WorkerMsg::Started(format!("read: {}", raw.display())));
-                    match fs::read(&raw) {
-                        Ok(bytes) => {
-                            if cancel_cloned.load(Ordering::Relaxed) {
-                                let _ = tx_cloned.send(WorkerMsg::Finished(canceled_result()));
-                                continue;
-                            }
-                            if raw_tx_cloned.send(RawBytesJob { raw, bytes }).is_err() {
-                                break;
-                            }
-                            stats_cloned.inc_buffered();
-                        }
-                        Err(err) => {
-                            let _ = tx_cloned.send(WorkerMsg::Finished(FileResult {
-                                preview: None,
-                                xmp: None,
-                                error: Some(format!(
-                                    "raw read failed for {}: {err}",
-                                    raw.display()
-                                )),
-                            }));
-                        }
+                    let _ = tx_cloned.send(WorkerMsg::Started(format!("queue: {}", raw.display())));
+                    stats_cloned.start_reading();
+                    stats_cloned.inc_buffered();
+                    let send_res = raw_tx_cloned.send(RawJob { raw });
+                    stats_cloned.finish_reading();
+                    if send_res.is_err() {
+                        stats_cloned.dec_buffered();
+                        break;
                     }
                 }
             }));
@@ -923,13 +974,13 @@ fn spawn_worker(
     Ok((rx, stats))
 }
 
-fn process_raw_bytes_job(
-    job: RawBytesJob,
+fn process_raw_job(
+    job: RawJob,
     opts: &RunOptions,
     tx: &Sender<WorkerMsg>,
     cancel: &AtomicBool,
 ) -> FileResult {
-    let RawBytesJob { raw, bytes } = job;
+    let RawJob { raw } = job;
     if cancel.load(Ordering::Relaxed) {
         return canceled_result();
     }
@@ -945,7 +996,11 @@ fn process_raw_bytes_job(
         if cancel.load(Ordering::Relaxed) {
             return Err(anyhow!(CANCELLED_MARKER));
         }
-        let rgb_full = decode_raw_bytes_to_rgb(&bytes, &raw)?;
+        let decoded = decode_raw_to_rgb_with_hint(&raw, opts.max_edge)?;
+        if let Some(warn) = decoded.warning {
+            let _ = tx.send(WorkerMsg::Started(format!("warning: {warn}")));
+        }
+        let rgb_full = decoded.image;
         if cancel.load(Ordering::Relaxed) {
             return Err(anyhow!(CANCELLED_MARKER));
         }

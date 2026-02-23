@@ -1,6 +1,8 @@
 use image::imageops::FilterType;
 use image::{GrayImage, RgbImage};
 
+const RESIZE_SKIP_REL_TOLERANCE: f32 = 0.20;
+
 #[derive(Debug, Clone, Copy)]
 pub struct PreprocessConfig {
     pub invert: bool,
@@ -28,6 +30,11 @@ pub fn resize_rgb_max_edge(img: &RgbImage, max_edge: u32) -> RgbImage {
     let (w, h) = img.dimensions();
     let long = w.max(h);
     if long <= max_edge {
+        return img.clone();
+    }
+    // Avoid tiny downscales near target size; they cost CPU but don't help detection much.
+    let near_target_ceiling = ((max_edge as f32) * (1.0 + RESIZE_SKIP_REL_TOLERANCE)).ceil() as u32;
+    if long <= near_target_ceiling {
         return img.clone();
     }
     let scale = max_edge as f32 / long as f32;
@@ -81,4 +88,23 @@ fn soft_knee(t: f32, k: f32) -> f32 {
         return 1.0 - fu;
     }
     t
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resize_rgb_max_edge;
+
+    #[test]
+    fn resize_skips_when_within_tolerance_above_target() {
+        let img = image::RgbImage::from_pixel(1040, 700, image::Rgb([1, 2, 3]));
+        let out = resize_rgb_max_edge(&img, 1000);
+        assert_eq!(out.dimensions(), (1040, 700));
+    }
+
+    #[test]
+    fn resize_still_happens_when_far_above_target() {
+        let img = image::RgbImage::from_pixel(1300, 700, image::Rgb([1, 2, 3]));
+        let out = resize_rgb_max_edge(&img, 1000);
+        assert_eq!(out.dimensions(), (1000, 538));
+    }
 }
