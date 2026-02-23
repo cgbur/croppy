@@ -16,16 +16,17 @@ Template:
 ```bash
 RAW_SRC="/mnt/c/Users/cburg/Pictures/YYYY/YYYY-MM-DD/FILE.ARW"
 CASE_ID="FILE"
+CASE_DIR="tmp/cases/${CASE_ID}"
 
-mkdir -p "tmp/raw-sandbox" "tmp/cases/${CASE_ID}/step01" "tmp/cases/${CASE_ID}/step02"
-cp -f "${RAW_SRC}" "tmp/raw-sandbox/${CASE_ID}.ARW"
+mkdir -p "${CASE_DIR}/raw" "${CASE_DIR}/step01" "${CASE_DIR}/step02"
+cp -f "${RAW_SRC}" "${CASE_DIR}/raw/${CASE_ID}.ARW"
 
 cargo run --release --example step01_prepare -- \
-  tmp/raw-sandbox \
-  --raw "tmp/raw-sandbox/${CASE_ID}.ARW" \
-  --out-dir "tmp/cases/${CASE_ID}/step01"
+  "${CASE_DIR}/raw" \
+  --raw "${CASE_DIR}/raw/${CASE_ID}.ARW" \
+  --out-dir "${CASE_DIR}/step01"
 
 cargo run --release --example step02_detect_stub -- \
-  --input "tmp/cases/${CASE_ID}/step01/next.json" \
-  --out-dir "tmp/cases/${CASE_ID}/step02"
+  --input "${CASE_DIR}/step01/next.json" \
+  --out-dir "${CASE_DIR}/step02"
 ```

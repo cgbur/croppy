@@ -4,7 +4,12 @@ use imageproc::drawing::draw_line_segment_mut;
 use imageproc::geometric_transformations::{Interpolation, rotate_about_center};
 use serde::Serialize;
 
-use crate::detect::{BoundsNorm, DetectConfig, Detection, detect_bounds_with_debug_cfg};
+use crate::detect::{BoundsNorm, Detection, detect_bounds_with_debug};
+use crate::kernels::line_fit::{
+    fit_line_x_of_y, fit_line_y_of_x, horizontal_fit_angle_deg, pick_rotation_angle,
+    vertical_fit_angle_deg,
+};
+use crate::kernels::peak_pick::{pick_peak_x, pick_peak_y};
 
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct EdgeLineRotation {
@@ -76,10 +81,9 @@ pub struct DetectRefineRun {
 
 pub fn run_detection_with_rotation_refine(
     gray: &GrayImage,
-    detect_cfg: DetectConfig,
     refine_cfg: RotationRefineConfig,
 ) -> Option<DetectRefineRun> {
-    let (det, _dbg) = detect_bounds_with_debug_cfg(gray, detect_cfg)?;
+    let (det, _dbg) = detect_bounds_with_debug(gray)?;
     let rotation_initial = rotation_debug_from_inner(gray, det.inner);
     let rotation_estimate = rotation_initial.as_ref().map(|d| d.summary);
 
@@ -99,7 +103,9 @@ pub fn run_detection_with_rotation_refine(
         );
         let theta = apply_deg.to_radians();
         let rotated = rotate_about_center(gray, theta, Interpolation::Bilinear, Luma([0u8]));
-        if let Some((det2, _dbg2)) = detect_bounds_with_debug_cfg(&rotated, detect_cfg) {
+        if let Some((det2, _dbg2)) = detect_bounds_with_debug(&rotated)
+            && refined_bounds_plausible(det.inner, det2.inner)
+        {
             final_detection = det2;
             refined_detection = Some(det2);
             rotation_applied_deg = Some(apply_deg);
@@ -119,6 +125,48 @@ pub fn run_detection_with_rotation_refine(
         rotation_applied_deg,
         rotation_residual_deg,
     })
+}
+
+fn refined_bounds_plausible(initial: BoundsNorm, refined: BoundsNorm) -> bool {
+    let area_initial = bounds_area(initial).max(1e-6);
+    let area_refined = bounds_area(refined);
+    let area_growth = area_refined / area_initial;
+
+    let touches_refined = border_touch_count(refined, 0.01);
+    let touches_initial = border_touch_count(initial, 0.01);
+
+    if touches_refined >= 2 && touches_initial < 2 && area_growth > 1.10 {
+        return false;
+    }
+
+    if area_refined > 0.95 && area_growth > 1.25 {
+        return false;
+    }
+
+    true
+}
+
+fn bounds_area(b: BoundsNorm) -> f32 {
+    let w = (b.right - b.left).abs().clamp(0.0, 1.0);
+    let h = (b.bottom - b.top).abs().clamp(0.0, 1.0);
+    w * h
+}
+
+fn border_touch_count(b: BoundsNorm, margin: f32) -> usize {
+    let mut count = 0usize;
+    if b.left <= margin {
+        count += 1;
+    }
+    if b.top <= margin {
+        count += 1;
+    }
+    if (1.0 - b.right) <= margin {
+        count += 1;
+    }
+    if (1.0 - b.bottom) <= margin {
+        count += 1;
+    }
+    count
 }
 
 pub fn rotation_debug_from_inner(
@@ -208,10 +256,10 @@ pub fn rotation_debug_from_inner(
         bottom_points: bottom_raw.iter().map(|(x, y)| [*x, *y]).collect(),
         left_points: left_raw.iter().map(|(x, y)| [*x, *y]).collect(),
         right_points: right_raw.iter().map(|(x, y)| [*x, *y]).collect(),
-        top_fit: top_fit.map(|f| [f.m, f.b]),
-        bottom_fit: bottom_fit.map(|f| [f.m, f.b]),
-        left_fit: left_fit.map(|f| [f.m, f.b]),
-        right_fit: right_fit.map(|f| [f.m, f.b]),
+        top_fit: top_fit.map(|f| [f.slope(), f.intercept()]),
+        bottom_fit: bottom_fit.map(|f| [f.slope(), f.intercept()]),
+        left_fit: left_fit.map(|f| [f.slope(), f.intercept()]),
+        right_fit: right_fit.map(|f| [f.slope(), f.intercept()]),
         legend: RotationLegend {
             top_points: "green points",
             bottom_points: "cyan points",
@@ -223,197 +271,6 @@ pub fn rotation_debug_from_inner(
             right_line: "orange line",
         },
     })
-}
-
-fn pick_peak_y(gray: &image::GrayImage, x: i32, y_min: i32, y_max: i32) -> Option<i32> {
-    let h = gray.height() as i32;
-    let y1 = y_min.clamp(2, h - 3);
-    let y2 = y_max.clamp(2, h - 3);
-    if y2 < y1 {
-        return None;
-    }
-    let mut best_grad = 0.0f32;
-    let mut best_y = y1;
-    for y in y1..=y2 {
-        let a = gray.get_pixel(x as u32, (y - 1) as u32)[0] as f32;
-        let b = gray.get_pixel(x as u32, (y + 1) as u32)[0] as f32;
-        let g = (b - a).abs();
-        if g > best_grad {
-            best_grad = g;
-            best_y = y;
-        }
-    }
-    if best_grad < 4.0 { None } else { Some(best_y) }
-}
-
-fn pick_peak_x(gray: &image::GrayImage, x_min: i32, x_max: i32, y: i32) -> Option<i32> {
-    let w = gray.width() as i32;
-    let x1 = x_min.clamp(2, w - 3);
-    let x2 = x_max.clamp(2, w - 3);
-    if x2 < x1 {
-        return None;
-    }
-    let mut best_grad = 0.0f32;
-    let mut best_x = x1;
-    for x in x1..=x2 {
-        let a = gray.get_pixel((x - 1) as u32, y as u32)[0] as f32;
-        let b = gray.get_pixel((x + 1) as u32, y as u32)[0] as f32;
-        let g = (b - a).abs();
-        if g > best_grad {
-            best_grad = g;
-            best_x = x;
-        }
-    }
-    if best_grad < 4.0 { None } else { Some(best_x) }
-}
-
-#[derive(Clone)]
-struct ConsensusLineFit {
-    m: f32,
-    b: f32,
-    score: f32,
-}
-
-fn horizontal_fit_angle_deg(f: &ConsensusLineFit) -> f32 {
-    f.m.atan().to_degrees()
-}
-
-fn vertical_fit_angle_deg(f: &ConsensusLineFit) -> f32 {
-    // Vertical fits are represented as x = m*y + b. For the edge angle relative
-    // to the x-axis, this sign is opposite to y = m*x + b.
-    (-f.m).atan().to_degrees()
-}
-
-fn fit_line_y_of_x(points: &[(f32, f32)]) -> Option<ConsensusLineFit> {
-    let pairs: Vec<(f32, f32)> = points.iter().map(|(x, y)| (*x, *y)).collect();
-    consensus_fit_line_t_of_u(&pairs)
-}
-
-fn fit_line_x_of_y(points: &[(f32, f32)]) -> Option<ConsensusLineFit> {
-    let pairs: Vec<(f32, f32)> = points.iter().map(|(x, y)| (*y, *x)).collect();
-    consensus_fit_line_t_of_u(&pairs)
-}
-
-fn consensus_fit_line_t_of_u(points: &[(f32, f32)]) -> Option<ConsensusLineFit> {
-    if points.len() < 6 {
-        return None;
-    }
-
-    let (min_t, max_t) = points
-        .iter()
-        .fold((f32::INFINITY, f32::NEG_INFINITY), |acc, p| {
-            (acc.0.min(p.0), acc.1.max(p.0))
-        });
-    let span_t = max_t - min_t;
-    if span_t <= 1e-3 {
-        return None;
-    }
-    let inlier_thresh = (span_t * 0.0035).clamp(0.8, 2.5);
-
-    let mut best_count = 0usize;
-    let mut best_err = f32::INFINITY;
-    let mut best_mb: Option<(f32, f32)> = None;
-
-    for i in 0..points.len() {
-        for j in (i + 1)..points.len() {
-            let (t1, u1) = points[i];
-            let (t2, u2) = points[j];
-            let dt = t2 - t1;
-            if dt.abs() <= 1e-3 {
-                continue;
-            }
-            let m = (u2 - u1) / dt;
-            let b = u1 - m * t1;
-
-            let mut count = 0usize;
-            let mut err = 0.0f32;
-            for (t, u) in points {
-                let r = (*u - (m * *t + b)).abs();
-                if r <= inlier_thresh {
-                    count += 1;
-                    err += r;
-                }
-            }
-
-            if count > best_count || (count == best_count && err < best_err) {
-                best_count = count;
-                best_err = err;
-                best_mb = Some((m, b));
-            }
-        }
-    }
-
-    let inlier_ratio = best_count as f32 / points.len() as f32;
-    if best_count < 6 || inlier_ratio < 0.55 {
-        return None;
-    }
-    let mean_inlier_residual = best_err / best_count as f32;
-    let span_score = span_t / (span_t + 120.0);
-    let residual_score = 1.0 / (1.0 + mean_inlier_residual);
-    let score = inlier_ratio * span_score * residual_score;
-
-    best_mb.map(|(m, b)| ConsensusLineFit { m, b, score })
-}
-
-fn pick_rotation_angle(
-    top: Option<&ConsensusLineFit>,
-    bottom: Option<&ConsensusLineFit>,
-    left: Option<&ConsensusLineFit>,
-    right: Option<&ConsensusLineFit>,
-) -> Option<f32> {
-    fn weighted_angle(edges: &[(f32, f32)]) -> Option<f32> {
-        let mut wsum = 0.0f32;
-        let mut asum = 0.0f32;
-        for (a, w) in edges {
-            if *w > 0.0 {
-                wsum += *w;
-                asum += *a * *w;
-            }
-        }
-        if wsum <= 1e-6 {
-            None
-        } else {
-            Some(asum / wsum)
-        }
-    }
-
-    let top_edge = top.map(|f| (horizontal_fit_angle_deg(f), f.score));
-    let bot_edge = bottom.map(|f| (horizontal_fit_angle_deg(f), f.score));
-    let left_edge = left.map(|f| (vertical_fit_angle_deg(f), f.score));
-    let right_edge = right.map(|f| (vertical_fit_angle_deg(f), f.score));
-
-    let mut horiz = Vec::new();
-    if let Some(e) = top_edge {
-        horiz.push(e);
-    }
-    if let Some(e) = bot_edge {
-        horiz.push(e);
-    }
-    let mut vert = Vec::new();
-    if let Some(e) = left_edge {
-        vert.push(e);
-    }
-    if let Some(e) = right_edge {
-        vert.push(e);
-    }
-
-    let h = weighted_angle(&horiz);
-    let v = weighted_angle(&vert);
-
-    match (h, v) {
-        (Some(ha), Some(va)) => {
-            if (ha - va).abs() <= 0.8 {
-                let hw = horiz.iter().map(|(_, w)| *w).sum::<f32>() * 1.5;
-                let vw = vert.iter().map(|(_, w)| *w).sum::<f32>();
-                weighted_angle(&[(ha, hw), (va, vw)])
-            } else {
-                Some(ha)
-            }
-        }
-        (Some(ha), None) => Some(ha),
-        (None, Some(va)) => Some(va),
-        (None, None) => None,
-    }
 }
 
 pub fn draw_norm_rect(img: &mut RgbImage, b: BoundsNorm, color: Rgb<u8>) {
@@ -507,48 +364,4 @@ fn rotate_point(x: f32, y: f32, cx: f32, cy: f32, theta: f32) -> (f32, f32) {
     let ct = theta.cos();
     let st = theta.sin();
     (cx + dx * ct - dy * st, cy + dx * st + dy * ct)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn fit_from_deg_y_of_x(deg: f32) -> ConsensusLineFit {
-        ConsensusLineFit {
-            m: deg.to_radians().tan(),
-            b: 0.0,
-            score: 1.0,
-        }
-    }
-
-    fn fit_from_deg_x_of_y(deg: f32) -> ConsensusLineFit {
-        // For x = m*y + b, m = -tan(theta) where theta is edge angle wrt x-axis.
-        ConsensusLineFit {
-            m: -deg.to_radians().tan(),
-            b: 0.0,
-            score: 1.0,
-        }
-    }
-
-    #[test]
-    fn pick_rotation_angle_does_not_cancel_from_vertical_sign_mismatch() {
-        let top = fit_from_deg_y_of_x(-0.30);
-        let bottom = fit_from_deg_y_of_x(-0.20);
-        let left = fit_from_deg_x_of_y(-0.40);
-        let right = fit_from_deg_x_of_y(-0.45);
-
-        let angle = pick_rotation_angle(Some(&top), Some(&bottom), Some(&left), Some(&right))
-            .expect("angle should be estimated");
-        assert!(angle < -0.2, "unexpected angle_deg={angle}");
-    }
-
-    #[test]
-    fn pick_rotation_angle_vertical_only_uses_same_sign_convention() {
-        let left = fit_from_deg_x_of_y(-0.35);
-        let right = fit_from_deg_x_of_y(-0.30);
-
-        let angle =
-            pick_rotation_angle(None, None, Some(&left), Some(&right)).expect("angle expected");
-        assert!(angle < -0.2, "unexpected angle_deg={angle}");
-    }
 }

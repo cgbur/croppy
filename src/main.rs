@@ -11,10 +11,10 @@ use std::{fs, thread};
 
 use anyhow::{Result, anyhow};
 use clap::Parser;
-use croppy::detect::{BoundsNorm, DetectConfig};
+use croppy::detect::BoundsNorm;
 use croppy::detect_refine::{
-    RotationRefineConfig, draw_norm_rect, draw_refined_inner_backproject,
-    run_detection_with_rotation_refine,
+    DetectRefineRun, RotationRefineConfig, draw_norm_rect, draw_refined_inner_backproject,
+    rotate_rgb_about_center, run_detection_with_rotation_refine,
 };
 use croppy::discover::{is_supported_raw, list_raw_files};
 use croppy::preprocess::{PreprocessConfig, prepare_image, resize_rgb_max_edge};
@@ -51,8 +51,35 @@ struct Args {
 struct RunOptions {
     write_xmp: bool,
     write_preview: bool,
+    preview_mode: PreviewMode,
     max_edge: u32,
     out_dir: PathBuf,
+    final_crop_scale_pct: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreviewMode {
+    DebugOverlay,
+    FinalCrop,
+    FinalCropFramed,
+}
+
+impl PreviewMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::DebugOverlay => "Overlay",
+            Self::FinalCrop => "Final Crop",
+            Self::FinalCropFramed => "Crop + Frame",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::DebugOverlay => Self::FinalCrop,
+            Self::FinalCrop => Self::FinalCropFramed,
+            Self::FinalCropFramed => Self::DebugOverlay,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -114,17 +141,23 @@ enum WorkerMsg {
 enum Screen {
     Select,
     Running,
-    Done,
 }
 
 const PREVIEW_SUBDIR: &str = "previews";
 const CANCELLED_MARKER: &str = "__croppy_cancelled__";
+const FINAL_CROP_SCALE_MIN_PCT: f32 = -20.0;
+const FINAL_CROP_SCALE_MAX_PCT: f32 = 20.0;
+const FINAL_CROP_SCALE_FINE_STEP_PCT: f32 = 0.25;
+const FRAME_PAD_FRAC: f32 = 0.06;
+const FRAME_PAD_MIN_PX: u32 = 20;
 
 struct App {
     raws: Vec<PathBuf>,
     selected: Vec<bool>,
     write_xmp: bool,
     write_preview: bool,
+    preview_mode: PreviewMode,
+    final_crop_scale_pct: f32,
     screen: Screen,
     file_cursor: usize,
     progress_done: usize,
@@ -135,7 +168,6 @@ struct App {
     worker_cancel: Option<Arc<AtomicBool>>,
     cancel_requested: bool,
     run_started_at: Option<Instant>,
-    run_finished_at: Option<Instant>,
     select_notice: Option<String>,
     overwrite_prompt_count: Option<usize>,
     pipeline_stats: Option<Arc<PipelineStats>>,
@@ -158,6 +190,8 @@ impl App {
             selected,
             write_xmp: false,
             write_preview: false,
+            preview_mode: PreviewMode::DebugOverlay,
+            final_crop_scale_pct: 0.0,
             screen: Screen::Select,
             file_cursor: 0,
             progress_done: 0,
@@ -168,7 +202,6 @@ impl App {
             worker_cancel: None,
             cancel_requested: false,
             run_started_at: None,
-            run_finished_at: None,
             select_notice: None,
             overwrite_prompt_count: None,
             pipeline_stats: None,
@@ -246,8 +279,13 @@ fn run_app(
             app.worker_rx = None;
             app.worker_cancel = None;
             app.pipeline_stats = None;
-            app.run_finished_at = Some(Instant::now());
-            app.screen = Screen::Done;
+            app.current_file.clear();
+            app.overwrite_prompt_count = None;
+            let (ok, failed, canceled) = summarize_results(&app.results);
+            app.select_notice = Some(format!(
+                "Run complete: {ok} ok / {failed} failed / {canceled} canceled."
+            ));
+            app.screen = Screen::Select;
         }
 
         terminal.draw(|f| {
@@ -255,7 +293,6 @@ fn run_app(
             match app.screen {
                 Screen::Select => draw_select(f, size, app, args),
                 Screen::Running => draw_running(f, size, app),
-                Screen::Done => draw_done(f, size, app, args),
             }
         })?;
 
@@ -280,13 +317,6 @@ fn run_app(
                         }
                     }
                     KeyCode::Char('q') => return Ok(()),
-                    _ => {}
-                },
-                Screen::Done => match key.code {
-                    KeyCode::Char('q') => return Ok(()),
-                    KeyCode::Esc | KeyCode::Enter => {
-                        app.screen = Screen::Select;
-                    }
                     _ => {}
                 },
             }
@@ -326,7 +356,7 @@ fn draw_select(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, app: &Ap
         .split(inner_area(area));
     let body = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(20), Constraint::Length(28)])
+        .constraints([Constraint::Min(20), Constraint::Length(32)])
         .split(chunks[1]);
     let selected_count = app.selected.iter().filter(|v| **v).count();
     let header = Paragraph::new(vec![
@@ -383,6 +413,37 @@ fn draw_select(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, app: &Ap
                 if app.write_preview { "ON" } else { "OFF" }
             )),
         ]),
+        Line::from(vec![
+            Span::styled("[p] ", key_style()),
+            Span::raw(format!("Preview Mode: {}", app.preview_mode.label())),
+        ]),
+        Line::from(Span::styled(
+            "Final Crop Scale",
+            Style::default().fg(Color::Gray),
+        )),
+        Line::from(vec![
+            Span::styled(
+                format!("{:+.2}%", app.final_crop_scale_pct),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled("[0]", key_style()),
+            Span::raw(" reset"),
+        ]),
+        Line::from(vec![
+            Span::styled("[-]/[=] ", key_style()),
+            Span::raw("+/-0.25%"),
+        ]),
+        Line::from(vec![
+            Span::styled("[,]/[.] ", key_style()),
+            Span::raw("+/-0.25%"),
+        ]),
+        Line::from(Span::styled(
+            "Positive keeps more border.",
+            Style::default().fg(Color::DarkGray),
+        )),
         Line::from(""),
         Line::from(vec![
             Span::styled("Preview Out: ", Style::default().fg(Color::Gray)),
@@ -413,6 +474,14 @@ fn draw_select(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, app: &Ap
         Span::raw(" xmp  "),
         Span::styled("v", key_style()),
         Span::raw(" preview  "),
+        Span::styled("p", key_style()),
+        Span::raw(" preview-mode  "),
+        Span::styled("[-]/[=]", key_style()),
+        Span::raw(" crop-scale  "),
+        Span::styled("[,]/[.]", key_style()),
+        Span::raw(" step  "),
+        Span::styled("0", key_style()),
+        Span::raw(" reset  "),
         Span::styled("y/n", key_style()),
         Span::raw(" confirm overwrite  "),
         Span::styled("Enter", key_style()),
@@ -507,45 +576,6 @@ fn draw_running(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, app: &A
     f.render_widget(footer, chunks[2]);
 }
 
-fn draw_done(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, app: &App, args: &Args) {
-    draw_screen_chrome(f, area, "Croppy", "Complete");
-    let (ok, failed, canceled) = summarize_results(&app.results);
-    let out_previews = preview_dir(&args.out_dir);
-    let elapsed = match (app.run_started_at, app.run_finished_at) {
-        (Some(start), Some(end)) => format_duration(end.saturating_duration_since(start)),
-        (Some(start), None) => format_duration(start.elapsed()),
-        _ => "0s".to_string(),
-    };
-    let mut text = vec![
-        Line::from(format!("Run complete in {elapsed}")),
-        Line::from(format!(
-            "Summary: {ok} ok / {failed} failed / {canceled} canceled"
-        )),
-        Line::from(format!("Preview dir: {}", out_previews.display())),
-    ];
-    if app.cancel_requested {
-        text.push(Line::from(Span::styled(
-            "Run was canceled by user.",
-            Style::default().fg(Color::Yellow),
-        )));
-    }
-    text.push(Line::from("Press Enter to return to file selection"));
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(6), Constraint::Length(3)])
-        .split(inner_area(area));
-    let p = Paragraph::new(text).block(panel("Run Summary", false));
-    f.render_widget(p, chunks[0]);
-    let footer = Paragraph::new(Line::from(vec![
-        Span::styled("Enter", key_style()),
-        Span::raw(" back to selection  "),
-        Span::styled("q", key_style()),
-        Span::raw(" exit"),
-    ]))
-    .block(panel("Keys", false));
-    f.render_widget(footer, chunks[1]);
-}
-
 fn accent() -> Color {
     Color::White
 }
@@ -630,6 +660,14 @@ fn inner_area(area: ratatui::layout::Rect) -> ratatui::layout::Rect {
     }
 }
 
+fn adjust_final_crop_scale_pct(current: f32, delta: f32) -> f32 {
+    clamp_final_crop_scale_pct(current + delta)
+}
+
+fn clamp_final_crop_scale_pct(value: f32) -> f32 {
+    value.clamp(FINAL_CROP_SCALE_MIN_PCT, FINAL_CROP_SCALE_MAX_PCT)
+}
+
 fn handle_select_key(app: &mut App, args: &Args, code: KeyCode) -> Result<bool> {
     if app.overwrite_prompt_count.is_some() {
         match code {
@@ -656,6 +694,42 @@ fn handle_select_key(app: &mut App, args: &Args, code: KeyCode) -> Result<bool> 
         }
         KeyCode::Char('v') => {
             app.write_preview = !app.write_preview;
+            app.select_notice = None;
+        }
+        KeyCode::Char('p') => {
+            app.preview_mode = app.preview_mode.next();
+            app.select_notice = None;
+        }
+        KeyCode::Char('[') | KeyCode::Char('-') => {
+            app.final_crop_scale_pct = adjust_final_crop_scale_pct(
+                app.final_crop_scale_pct,
+                -FINAL_CROP_SCALE_FINE_STEP_PCT,
+            );
+            app.select_notice = None;
+        }
+        KeyCode::Char(']') | KeyCode::Char('=') => {
+            app.final_crop_scale_pct = adjust_final_crop_scale_pct(
+                app.final_crop_scale_pct,
+                FINAL_CROP_SCALE_FINE_STEP_PCT,
+            );
+            app.select_notice = None;
+        }
+        KeyCode::Char(',') => {
+            app.final_crop_scale_pct = adjust_final_crop_scale_pct(
+                app.final_crop_scale_pct,
+                -FINAL_CROP_SCALE_FINE_STEP_PCT,
+            );
+            app.select_notice = None;
+        }
+        KeyCode::Char('.') => {
+            app.final_crop_scale_pct = adjust_final_crop_scale_pct(
+                app.final_crop_scale_pct,
+                FINAL_CROP_SCALE_FINE_STEP_PCT,
+            );
+            app.select_notice = None;
+        }
+        KeyCode::Char('0') => {
+            app.final_crop_scale_pct = 0.0;
             app.select_notice = None;
         }
         KeyCode::Char(' ') => {
@@ -724,12 +798,13 @@ fn start_run(app: &mut App, args: &Args, overwrite_confirmed: bool) -> Result<()
     app.results.clear();
     app.cancel_requested = false;
     app.run_started_at = Some(Instant::now());
-    app.run_finished_at = None;
     let opts = RunOptions {
         write_xmp: app.write_xmp,
         write_preview: app.write_preview,
+        preview_mode: app.preview_mode,
         max_edge: args.max_edge,
         out_dir: args.out_dir.clone(),
+        final_crop_scale_pct: app.final_crop_scale_pct,
     };
     let cancel = Arc::new(AtomicBool::new(false));
     let (rx, stats) = spawn_worker(files, opts, cancel.clone())?;
@@ -888,13 +963,8 @@ fn process_raw_bytes_job(
             return Err(anyhow!(CANCELLED_MARKER));
         }
         let prep_gray = rgb_to_gray(&prepared);
-        // Match the example Step 02 defaults so previews and debug runs align.
-        let detect_cfg = DetectConfig {
-            band_margin_pct: 0.22, // same as step02 example default
-        };
         let refine = run_detection_with_rotation_refine(
             &prep_gray,
-            detect_cfg,
             RotationRefineConfig {
                 refine_rotation: true,
                 apply_rotation_decision: true,
@@ -907,30 +977,28 @@ fn process_raw_bytes_job(
             if cancel.load(Ordering::Relaxed) {
                 return Err(anyhow!(CANCELLED_MARKER));
             }
-            let mut overlay = prepared.clone();
-            draw_norm_rect(
-                &mut overlay,
-                refine.detection_initial.outer,
-                image::Rgb([255, 0, 0]),
-            );
-            draw_norm_rect(
-                &mut overlay,
-                refine.detection_initial.inner,
-                image::Rgb([255, 255, 0]),
-            );
-            if let (Some(refined_det), Some(applied)) =
-                (refine.detection_refined, refine.rotation_applied_deg)
-            {
-                draw_refined_inner_backproject(
-                    &mut overlay,
-                    refined_det.inner,
-                    applied.to_radians(),
-                    image::Rgb([80, 255, 255]),
-                );
-            }
             let preview_path = preview_path_for(&raw, &opts.out_dir);
             guard_write_target(&raw, &preview_path, "preview")?;
-            overlay.save_with_format(&preview_path, image::ImageFormat::Jpeg)?;
+            match opts.preview_mode {
+                PreviewMode::DebugOverlay => write_overlay_preview(
+                    &prepared,
+                    &refine,
+                    opts.final_crop_scale_pct,
+                    &preview_path,
+                )?,
+                PreviewMode::FinalCrop => write_final_crop_preview(
+                    &prepared,
+                    &refine,
+                    opts.final_crop_scale_pct,
+                    &preview_path,
+                )?,
+                PreviewMode::FinalCropFramed => write_framed_final_crop_preview(
+                    &prepared,
+                    &refine,
+                    opts.final_crop_scale_pct,
+                    &preview_path,
+                )?,
+            }
             out.preview = Some(preview_path);
         }
 
@@ -942,6 +1010,7 @@ fn process_raw_bytes_job(
                 refine.detection.inner,
                 refine.rotation_applied_deg,
                 preprocess_cfg.flip_180,
+                opts.final_crop_scale_pct,
             );
             let xmp_path = raw.with_extension("xmp");
             guard_write_target(&raw, &xmp_path, "xmp sidecar")?;
@@ -978,6 +1047,127 @@ fn preview_path_for(raw: &Path, out_dir: &Path) -> PathBuf {
     preview_dir(out_dir).join(base)
 }
 
+fn write_overlay_preview(
+    prepared: &image::RgbImage,
+    refine: &DetectRefineRun,
+    final_crop_scale_pct: f32,
+    preview_path: &Path,
+) -> Result<()> {
+    let mut overlay = prepared.clone();
+    draw_norm_rect(
+        &mut overlay,
+        refine.detection_initial.inner,
+        image::Rgb([255, 255, 0]),
+    );
+    if let (Some(refined_det), Some(applied_deg)) =
+        (refine.detection_refined, refine.rotation_applied_deg)
+    {
+        draw_refined_inner_backproject(
+            &mut overlay,
+            refined_det.inner,
+            applied_deg.to_radians(),
+            image::Rgb([80, 255, 255]),
+        );
+    }
+    if final_crop_scale_pct.abs() > f32::EPSILON {
+        let (final_inner, theta_opt) = final_preview_inner_bounds(refine, final_crop_scale_pct);
+        if let Some(theta) = theta_opt {
+            draw_refined_inner_backproject(
+                &mut overlay,
+                final_inner,
+                theta,
+                image::Rgb([120, 255, 120]),
+            );
+        } else {
+            draw_norm_rect(&mut overlay, final_inner, image::Rgb([120, 255, 120]));
+        }
+    }
+    overlay.save_with_format(preview_path, image::ImageFormat::Jpeg)?;
+    Ok(())
+}
+
+fn write_final_crop_preview(
+    prepared: &image::RgbImage,
+    refine: &DetectRefineRun,
+    final_crop_scale_pct: f32,
+    preview_path: &Path,
+) -> Result<()> {
+    let crop = render_final_crop_image(prepared, refine, final_crop_scale_pct);
+    crop.save_with_format(preview_path, image::ImageFormat::Jpeg)?;
+    Ok(())
+}
+
+fn write_framed_final_crop_preview(
+    prepared: &image::RgbImage,
+    refine: &DetectRefineRun,
+    final_crop_scale_pct: f32,
+    preview_path: &Path,
+) -> Result<()> {
+    let crop = render_final_crop_image(prepared, refine, final_crop_scale_pct);
+    let framed = render_crop_with_white_frame(&crop);
+    framed.save_with_format(preview_path, image::ImageFormat::Jpeg)?;
+    Ok(())
+}
+
+fn final_preview_inner_bounds(
+    refine: &DetectRefineRun,
+    final_crop_scale_pct: f32,
+) -> (BoundsNorm, Option<f32>) {
+    if let (Some(refined_det), Some(applied_deg)) =
+        (refine.detection_refined, refine.rotation_applied_deg)
+    {
+        let scaled =
+            scale_bounds_about_center(normalize_bounds(refined_det.inner), final_crop_scale_pct);
+        (scaled, Some(applied_deg.to_radians()))
+    } else {
+        let scaled = scale_bounds_about_center(
+            normalize_bounds(refine.detection.inner),
+            final_crop_scale_pct,
+        );
+        (scaled, None)
+    }
+}
+
+fn render_final_crop_image(
+    prepared: &image::RgbImage,
+    refine: &DetectRefineRun,
+    final_crop_scale_pct: f32,
+) -> image::RgbImage {
+    let (final_inner, theta_opt) = final_preview_inner_bounds(refine, final_crop_scale_pct);
+    if let Some(theta) = theta_opt {
+        let rotated = rotate_rgb_about_center(prepared, theta);
+        extract_norm_crop(&rotated, final_inner)
+    } else {
+        extract_norm_crop(prepared, final_inner)
+    }
+}
+
+fn extract_norm_crop(img: &image::RgbImage, b: BoundsNorm) -> image::RgbImage {
+    let w = img.width() as f32;
+    let h = img.height() as f32;
+    let x1 = (b.left * w).round().clamp(0.0, w - 1.0) as u32;
+    let x2 = (b.right * w).round().clamp(0.0, w) as u32;
+    let y1 = (b.top * h).round().clamp(0.0, h - 1.0) as u32;
+    let y2 = (b.bottom * h).round().clamp(0.0, h) as u32;
+    let cw = x2.saturating_sub(x1).max(1);
+    let ch = y2.saturating_sub(y1).max(1);
+    image::imageops::crop_imm(img, x1, y1, cw, ch).to_image()
+}
+
+fn render_crop_with_white_frame(crop: &image::RgbImage) -> image::RgbImage {
+    let pad_x = ((crop.width() as f32 * FRAME_PAD_FRAC).round() as u32).max(FRAME_PAD_MIN_PX);
+    let pad_y = ((crop.height() as f32 * FRAME_PAD_FRAC).round() as u32).max(FRAME_PAD_MIN_PX);
+    let out_w = crop.width().saturating_add(pad_x.saturating_mul(2)).max(1);
+    let out_h = crop.height().saturating_add(pad_y.saturating_mul(2)).max(1);
+    let mut framed = image::RgbImage::from_pixel(out_w, out_h, image::Rgb([255, 255, 255]));
+
+    for (x, y, px) in crop.enumerate_pixels() {
+        framed.put_pixel(x + pad_x, y + pad_y, *px);
+    }
+
+    framed
+}
+
 fn canceled_result() -> FileResult {
     FileResult {
         preview: None,
@@ -990,6 +1180,7 @@ fn xmp_crop_from_detection(
     inner_detected: BoundsNorm,
     rotation_applied_deg: Option<f32>,
     preprocess_flip_180: bool,
+    final_crop_scale_pct: f32,
 ) -> XmpCrop {
     let mut bounds = inner_detected;
     if preprocess_flip_180 {
@@ -999,6 +1190,7 @@ fn xmp_crop_from_detection(
         bounds = rotate_bounds_180(bounds);
     }
     bounds = normalize_bounds(bounds);
+    bounds = scale_bounds_about_center(bounds, final_crop_scale_pct);
     XmpCrop {
         left: bounds.left,
         top: bounds.top,
@@ -1036,6 +1228,23 @@ fn normalize_bounds(b: BoundsNorm) -> BoundsNorm {
         right,
         bottom,
     }
+}
+
+fn scale_bounds_about_center(bounds: BoundsNorm, scale_pct: f32) -> BoundsNorm {
+    let scale_pct = clamp_final_crop_scale_pct(scale_pct);
+    let scale = (1.0 + (scale_pct / 100.0)).max(0.01);
+
+    let cx = (bounds.left + bounds.right) * 0.5;
+    let cy = (bounds.top + bounds.bottom) * 0.5;
+    let half_w = (bounds.right - bounds.left).abs() * 0.5 * scale;
+    let half_h = (bounds.bottom - bounds.top).abs() * 0.5 * scale;
+
+    normalize_bounds(BoundsNorm {
+        left: cx - half_w,
+        top: cy - half_h,
+        right: cx + half_w,
+        bottom: cy + half_h,
+    })
 }
 
 fn guard_write_target(raw: &Path, target: &Path, output_kind: &str) -> Result<()> {
@@ -1113,7 +1322,7 @@ fn write_xmp_sidecar(
 
 #[cfg(test)]
 mod tests {
-    use super::{BoundsNorm, xmp_crop_from_detection};
+    use super::{BoundsNorm, PreviewMode, xmp_crop_from_detection};
 
     fn assert_close(actual: f32, expected: f32) {
         assert!(
@@ -1133,6 +1342,7 @@ mod tests {
             },
             Some(-0.5),
             false,
+            0.0,
         );
         assert_close(out.left, 0.1);
         assert_close(out.top, 0.2);
@@ -1152,6 +1362,7 @@ mod tests {
             },
             Some(1.25),
             true,
+            0.0,
         );
         assert_close(out.left, 0.2);
         assert_close(out.top, 0.1);
@@ -1171,11 +1382,97 @@ mod tests {
             },
             None,
             false,
+            0.0,
         );
         assert_close(out.left, 0.0);
         assert_close(out.top, 0.2);
         assert_close(out.right, 1.0);
         assert_close(out.bottom, 0.9);
         assert_close(out.angle_deg, 0.0);
+    }
+
+    #[test]
+    fn xmp_crop_expands_around_center() {
+        let out = xmp_crop_from_detection(
+            BoundsNorm {
+                left: 0.2,
+                top: 0.3,
+                right: 0.8,
+                bottom: 0.7,
+            },
+            None,
+            false,
+            10.0,
+        );
+        assert_close(out.left, 0.17);
+        assert_close(out.top, 0.28);
+        assert_close(out.right, 0.83);
+        assert_close(out.bottom, 0.72);
+        assert_close(out.angle_deg, 0.0);
+    }
+
+    #[test]
+    fn xmp_crop_shrinks_around_center() {
+        let out = xmp_crop_from_detection(
+            BoundsNorm {
+                left: 0.2,
+                top: 0.3,
+                right: 0.8,
+                bottom: 0.7,
+            },
+            None,
+            false,
+            -10.0,
+        );
+        assert_close(out.left, 0.23);
+        assert_close(out.top, 0.32);
+        assert_close(out.right, 0.77);
+        assert_close(out.bottom, 0.68);
+        assert_close(out.angle_deg, 0.0);
+    }
+
+    #[test]
+    fn xmp_crop_scale_is_clamped() {
+        let out = xmp_crop_from_detection(
+            BoundsNorm {
+                left: 0.2,
+                top: 0.3,
+                right: 0.8,
+                bottom: 0.7,
+            },
+            None,
+            false,
+            100.0,
+        );
+        assert_close(out.left, 0.14);
+        assert_close(out.top, 0.26);
+        assert_close(out.right, 0.86);
+        assert_close(out.bottom, 0.74);
+    }
+
+    #[test]
+    fn preview_mode_cycles() {
+        assert_eq!(PreviewMode::DebugOverlay.next(), PreviewMode::FinalCrop);
+        assert_eq!(PreviewMode::FinalCrop.next(), PreviewMode::FinalCropFramed);
+        assert_eq!(
+            PreviewMode::FinalCropFramed.next(),
+            PreviewMode::DebugOverlay
+        );
+    }
+
+    #[test]
+    fn framed_crop_adds_white_border_area() {
+        let crop = image::RgbImage::from_pixel(100, 50, image::Rgb([12, 34, 56]));
+        let framed = super::render_crop_with_white_frame(&crop);
+        let pad_x = ((crop.width() as f32 * super::FRAME_PAD_FRAC).round() as u32)
+            .max(super::FRAME_PAD_MIN_PX);
+        let pad_y = ((crop.height() as f32 * super::FRAME_PAD_FRAC).round() as u32)
+            .max(super::FRAME_PAD_MIN_PX);
+        assert!(framed.width() > crop.width());
+        assert!(framed.height() > crop.height());
+        // Top-left remains background white.
+        assert_eq!(*framed.get_pixel(0, 0), image::Rgb([255, 255, 255]));
+        // The crop is pasted directly with no synthetic border stroke.
+        assert_eq!(*framed.get_pixel(pad_x, pad_y), image::Rgb([12, 34, 56]));
     }
 }
