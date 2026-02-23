@@ -472,6 +472,8 @@ fn draw_profile_with_band(
     }
     let band_h = (h / 4).max(40);
     let plot_h = h - band_h;
+    let pad = 10u32;
+    let band_w = w.saturating_sub(pad * 2).max(1);
 
     // Plot in top region.
     {
@@ -492,7 +494,7 @@ fn draw_profile_with_band(
         )
     } else {
         // Horizontal profile used x-range [horizontal_sample_x0..horizontal_sample_x1] over full height.
-        // Rotate so row index (y) maps left->right like plot x-axis.
+        // Rotate so row index (y) maps left->right with top at the left side.
         let vertical = crop_gray(
             gray,
             spec.horizontal_sample_x0,
@@ -500,12 +502,22 @@ fn draw_profile_with_band(
             spec.horizontal_sample_x1,
             gray.height().saturating_sub(1),
         );
-        image::imageops::rotate90(&vertical)
+        image::imageops::rotate270(&vertical)
     };
 
-    let band = image::imageops::resize(&strip, w, band_h, image::imageops::FilterType::Triangle);
+    let band = image::imageops::resize(
+        &strip,
+        band_w,
+        band_h,
+        image::imageops::FilterType::Triangle,
+    );
     let band_rgb = image::DynamicImage::ImageLuma8(band).to_rgb8();
-    overlay(out, &band_rgb, 0, plot_h);
+    let mut band_canvas = RgbImage::new(w, band_h);
+    for px in band_canvas.pixels_mut() {
+        *px = Rgb([16, 16, 16]);
+    }
+    overlay(&mut band_canvas, &band_rgb, pad.min(w.saturating_sub(1)), 0);
+    overlay(out, &band_canvas, 0, plot_h);
 }
 
 fn crop_gray(gray: &GrayImage, x0: u32, y0: u32, x1: u32, y1: u32) -> GrayImage {
