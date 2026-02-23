@@ -452,6 +452,7 @@ dependencies = [
  "imageproc",
  "rand 0.9.2",
  "ratatui",
+ "rayon",
  "rsraw",
  "rsraw-sys",
  "serde",

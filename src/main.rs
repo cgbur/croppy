@@ -1,11 +1,10 @@
-use std::collections::VecDeque;
 use std::io::{self, Stdout};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
@@ -30,6 +29,8 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Gauge, List, ListItem, Paragraph};
+use rayon::ThreadPoolBuilder;
+use rayon::prelude::*;
 
 #[derive(Parser, Debug)]
 #[command(about = "Croppy TUI batch runner")]
@@ -89,93 +90,6 @@ struct FileResult {
     error: Option<String>,
 }
 
-struct RawJob {
-    raw: PathBuf,
-}
-
-struct PipelineStats {
-    pending_count: AtomicUsize,
-    reading_count: AtomicUsize,
-    reading_peak: AtomicUsize,
-    processing_count: AtomicUsize,
-    processing_peak: AtomicUsize,
-    buffered_count: AtomicUsize,
-    buffered_peak: AtomicUsize,
-    buffered_capacity: usize,
-    read_workers: usize,
-    process_workers: usize,
-}
-
-impl PipelineStats {
-    fn new(
-        pending_paths: usize,
-        buffered_capacity: usize,
-        read_workers: usize,
-        process_workers: usize,
-    ) -> Self {
-        Self {
-            pending_count: AtomicUsize::new(pending_paths),
-            reading_count: AtomicUsize::new(0),
-            reading_peak: AtomicUsize::new(0),
-            processing_count: AtomicUsize::new(0),
-            processing_peak: AtomicUsize::new(0),
-            buffered_count: AtomicUsize::new(0),
-            buffered_peak: AtomicUsize::new(0),
-            buffered_capacity,
-            read_workers,
-            process_workers,
-        }
-    }
-
-    fn mark_path_taken(&self) {
-        Self::dec_counter(&self.pending_count);
-    }
-
-    fn start_reading(&self) {
-        Self::inc_with_peak(&self.reading_count, &self.reading_peak);
-    }
-
-    fn finish_reading(&self) {
-        Self::dec_counter(&self.reading_count);
-    }
-
-    fn start_processing(&self) {
-        Self::inc_with_peak(&self.processing_count, &self.processing_peak);
-    }
-
-    fn finish_processing(&self) {
-        Self::dec_counter(&self.processing_count);
-    }
-
-    fn inc_buffered(&self) {
-        Self::inc_with_peak(&self.buffered_count, &self.buffered_peak);
-    }
-
-    fn dec_buffered(&self) {
-        Self::dec_counter(&self.buffered_count);
-    }
-
-    fn inc_with_peak(count: &AtomicUsize, peak: &AtomicUsize) {
-        let next = count.fetch_add(1, Ordering::Relaxed) + 1;
-        peak.fetch_max(next, Ordering::Relaxed);
-    }
-
-    fn dec_counter(count: &AtomicUsize) {
-        loop {
-            let cur = count.load(Ordering::Relaxed);
-            if cur == 0 {
-                break;
-            }
-            if count
-                .compare_exchange(cur, cur - 1, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                break;
-            }
-        }
-    }
-}
-
 enum WorkerMsg {
     Started(String),
     Finished(FileResult),
@@ -215,7 +129,6 @@ struct App {
     run_started_at: Option<Instant>,
     select_notice: Option<String>,
     overwrite_prompt_count: Option<usize>,
-    pipeline_stats: Option<Arc<PipelineStats>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -249,7 +162,6 @@ impl App {
             run_started_at: None,
             select_notice: None,
             overwrite_prompt_count: None,
-            pipeline_stats: None,
         }
     }
 
@@ -323,7 +235,6 @@ fn run_app(
         if worker_done {
             app.worker_rx = None;
             app.worker_cancel = None;
-            app.pipeline_stats = None;
             app.current_file.clear();
             app.overwrite_prompt_count = None;
             let (ok, failed, canceled) = summarize_results(&app.results);
@@ -572,34 +483,11 @@ fn draw_running(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, app: &A
         .run_started_at
         .map(|t| format_duration(t.elapsed()))
         .unwrap_or_else(|| "0s".to_string());
-    let (pipeline_line, workers_line) = if let Some(stats) = &app.pipeline_stats {
-        let pending = stats.pending_count.load(Ordering::Relaxed);
-        let buffered = stats.buffered_count.load(Ordering::Relaxed);
-        let buffered_peak = stats.buffered_peak.load(Ordering::Relaxed);
-        let reading = stats.reading_count.load(Ordering::Relaxed);
-        let reading_peak = stats.reading_peak.load(Ordering::Relaxed);
-        let processing = stats.processing_count.load(Ordering::Relaxed);
-        let processing_peak = stats.processing_peak.load(Ordering::Relaxed);
-        (
-            format!(
-                "Pipeline: pending {pending} | buffered {buffered}/{} (peak {buffered_peak})",
-                stats.buffered_capacity
-            ),
-            format!(
-                "Workers: read {reading}/{} (peak {reading_peak}) | process {processing}/{} (peak {processing_peak})",
-                stats.read_workers, stats.process_workers
-            ),
-        )
-    } else {
-        ("Pipeline: -".to_string(), "Workers: -".to_string())
-    };
     let current = Paragraph::new(vec![
         Line::from(format!("Elapsed: {elapsed}")),
         Line::from(format!(
             "Done: {ok_count} ok  {failed_count} failed  {canceled_count} canceled"
         )),
-        Line::from(pipeline_line),
-        Line::from(workers_line),
         Line::from(vec![
             Span::styled("Current: ", Style::default().fg(Color::Gray)),
             Span::styled(
@@ -864,10 +752,9 @@ fn start_run(app: &mut App, args: &Args, overwrite_confirmed: bool) -> Result<()
         final_crop_scale_pct: app.final_crop_scale_pct,
     };
     let cancel = Arc::new(AtomicBool::new(false));
-    let (rx, stats) = spawn_worker(files, opts, cancel.clone())?;
+    let rx = spawn_worker(files, opts, cancel.clone())?;
     app.worker_rx = Some(rx);
     app.worker_cancel = Some(cancel);
-    app.pipeline_stats = Some(stats);
     app.screen = Screen::Running;
     Ok(())
 }
@@ -876,111 +763,37 @@ fn spawn_worker(
     files: Vec<PathBuf>,
     opts: RunOptions,
     cancel: Arc<AtomicBool>,
-) -> Result<(Receiver<WorkerMsg>, Arc<PipelineStats>)> {
+) -> Result<Receiver<WorkerMsg>> {
     fs::create_dir_all(preview_dir(&opts.out_dir))?;
     let (tx, rx) = mpsc::channel();
-    let cores = thread::available_parallelism()
+    let worker_count = thread::available_parallelism()
         .map(|n| n.get())
-        .unwrap_or(4);
-    // Keep a meaningful reader stage on high-core systems so processors are not starved.
-    let read_workers = (cores / 3).clamp(2, 8);
-    let process_workers = cores.saturating_sub(read_workers).max(2);
-    let buffered_jobs = cores.max(1);
-    let stats = Arc::new(PipelineStats::new(
-        files.len(),
-        buffered_jobs,
-        read_workers,
-        process_workers,
-    ));
-    let stats_for_worker = Arc::clone(&stats);
+        .unwrap_or(4)
+        .max(1);
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(worker_count)
+        .build()
+        .map_err(|e| anyhow!("failed to create rayon thread pool: {e}"))?;
+
     thread::spawn(move || {
-        let buffered_jobs = stats_for_worker.buffered_capacity;
-
-        let queue = Arc::new(Mutex::new(VecDeque::from(files)));
-        let (raw_tx, raw_rx) = mpsc::sync_channel::<RawJob>(buffered_jobs);
-        let shared_raw_rx = Arc::new(Mutex::new(raw_rx));
-
-        let mut process_handles = Vec::with_capacity(process_workers);
-        for _ in 0..process_workers {
-            let opts_cloned = opts.clone();
-            let tx_cloned = tx.clone();
-            let cancel_cloned = Arc::clone(&cancel);
-            let raw_rx_cloned = Arc::clone(&shared_raw_rx);
-            let stats_cloned = Arc::clone(&stats_for_worker);
-            process_handles.push(thread::spawn(move || {
-                loop {
-                    let next_job = {
-                        let rx_guard = raw_rx_cloned.lock().expect("raw_rx mutex poisoned");
-                        rx_guard.recv()
-                    };
-                    let Ok(job) = next_job else {
-                        break;
-                    };
-                    stats_cloned.dec_buffered();
-                    stats_cloned.start_processing();
-                    let res = process_raw_job(job, &opts_cloned, &tx_cloned, &cancel_cloned);
-                    stats_cloned.finish_processing();
-                    let _ = tx_cloned.send(WorkerMsg::Finished(res));
-                }
-            }));
-        }
-
-        let mut read_handles = Vec::with_capacity(read_workers);
-        for _ in 0..read_workers {
-            let queue_cloned = Arc::clone(&queue);
-            let raw_tx_cloned = raw_tx.clone();
-            let tx_cloned = tx.clone();
-            let cancel_cloned = Arc::clone(&cancel);
-            let stats_cloned = Arc::clone(&stats_for_worker);
-            read_handles.push(thread::spawn(move || {
-                loop {
-                    let maybe_raw = {
-                        let mut guard = queue_cloned.lock().expect("queue mutex poisoned");
-                        guard.pop_front()
-                    };
-                    let Some(raw) = maybe_raw else {
-                        break;
-                    };
-                    stats_cloned.mark_path_taken();
-
-                    if cancel_cloned.load(Ordering::Relaxed) {
-                        let _ = tx_cloned.send(WorkerMsg::Finished(canceled_result()));
-                        continue;
-                    }
-
-                    let _ = tx_cloned.send(WorkerMsg::Started(format!("queue: {}", raw.display())));
-                    stats_cloned.start_reading();
-                    stats_cloned.inc_buffered();
-                    let send_res = raw_tx_cloned.send(RawJob { raw });
-                    stats_cloned.finish_reading();
-                    if send_res.is_err() {
-                        stats_cloned.dec_buffered();
-                        break;
-                    }
-                }
-            }));
-        }
-        drop(raw_tx);
-
-        for handle in read_handles {
-            let _ = handle.join();
-        }
-        for handle in process_handles {
-            let _ = handle.join();
-        }
+        pool.install(|| {
+            files.into_par_iter().for_each(|raw| {
+                let res = process_raw_file(raw, &opts, &tx, &cancel);
+                let _ = tx.send(WorkerMsg::Finished(res));
+            });
+        });
 
         let _ = tx.send(WorkerMsg::Done);
     });
-    Ok((rx, stats))
+    Ok(rx)
 }
 
-fn process_raw_job(
-    job: RawJob,
+fn process_raw_file(
+    raw: PathBuf,
     opts: &RunOptions,
     tx: &Sender<WorkerMsg>,
     cancel: &AtomicBool,
 ) -> FileResult {
-    let RawJob { raw } = job;
     if cancel.load(Ordering::Relaxed) {
         return canceled_result();
     }
