@@ -1,113 +1,131 @@
-# Croppy (Rust-only Steps)
+# Croppy
 
-This repo has:
-- a `croppy` TUI main binary (`cargo run --release -- ...`)
-- debug step tools in `examples/` over the shared Rust library.
+Croppy is a Rust TUI tool that batch-generates Lightroom crop sidecars for scanned film negatives.
+
+## Why this exists
+
+After scanning negatives (for example with holders like the VALOI easy35 or a custom camera scanning setup), frames are often slightly off-center, skewed, or inconsistent.  
+Manually fixing crop on every frame in Lightroom before running Negative Lab Pro is slow.
+
+Croppy is meant to remove most of that manual first-pass crop work.
+
+## What it does
+
+- Scans a folder of RAW files.
+- Detects each frame boundary with lightweight signal-processing heuristics.
+- Writes Lightroom-compatible `.xmp` crop sidecars next to each RAW.
+- Optionally writes preview JPEGs to inspect results.
+
+Croppy does **not** modify, delete, or rewrite your RAW files.
+
+## Typical Lightroom + Negative Lab Pro flow
+
+1. Bulk import your scanned RAW negatives into Lightroom Classic.
+2. Run Croppy on the scan directory.
+3. In Croppy, select files and enable `XMP Sidecars`.
+4. Back in Lightroom, select the files and use `Metadata > Read Metadata from Files` (or right-click equivalent) to apply crops.
+5. Do any needed flips/inversion/WB adjustments in Lightroom.
+6. Run Negative Lab Pro in bulk, usually roll by roll.
+
+## Install
+
+### Build from source
+
+```bash
+cargo build --release
+```
+
+Binary path:
+
+```text
+target/release/croppy
+```
 
 ## Run
 
-1. Prepare one RAW image (random or fixed), then preprocess:
-- grayscale
-- invert
-- levels stretch
-- optional 180-degree flip
+Basic run:
 
 ```bash
-cargo run --release --features debug-artifacts --example step01_prepare -- \
-  /path/to/raw/folder \
-  --recursive \
-  --out-dir tmp/step01
+cargo run --release -- /path/to/raw/folder
 ```
 
-Useful flags:
-- `--raw <PATH>` choose a specific RAW instead of random
-- `--invert <true|false>`
-- `--flip-180 <true|false>`
-- `--black-pct <f32>` and `--white-pct <f32>` (defaults: `2`, `80`)
-- `--knee-pct <f32>` soft roll-off width in percent (default `2`)
-- `--max-edge <u32>` resize long edge before preprocessing (default `1000`)
-- `--keep-color` write `prepared_color.jpg`
-
-2. Run boundary detection on prepared image:
+Or with built binary:
 
 ```bash
-cargo run --release --features debug-artifacts --example step02_detect_stub -- \
-  --input tmp/step01/next.json
+./target/release/croppy /path/to/raw/folder
 ```
 
-Sampling options:
-- `--out-dir <PATH>` optional output directory (default: same directory as `--input`)
-- `--refine-rotation <true|false>` estimate from fixed inner-edge lines, rotate once, re-detect once (default `true`)
-- `--max-refine-abs-deg <f32>` max applied correction in degrees (default `3.0`)
+Useful options:
 
-## Handoff JSON
+- `--max-edge <N>` downscale long edge before detection (default `1000`)
+- `--out-dir <PATH>` where preview output folder is created (default current directory)
+- `--recursive` recursive scan flag (scan is recursive in normal use)
 
-`tmp/step01/next.json` contains paths plus minimal transform metadata:
+Supported RAW extensions include: `ARW`, `CR2`, `CR3`, `NEF`, `NRW`, `RAF`, `ORF`, `RW2`, `DNG`, `PEF`.
 
-```json
-{
-  "raw": "/absolute/or/mnt/path/file.ARW",
-  "prepared": "tmp/step01/prepared.jpg",
-  "preprocess": "bw+invert+levels+flip180",
-  "transform": {
-    "raw_width": 6336,
-    "raw_height": 4224,
-    "prepared_width": 1000,
-    "prepared_height": 667,
-    "flip_180": true
-  }
-}
-```
+## TUI controls
 
-Step 2 outputs:
-- `tmp/step01/overlay_initial.jpg` (yellow initial inner)
-- `tmp/step01/overlay.jpg` (same static image, plus cyan refined inner mapped back after rotation refine)
-- `tmp/step01/result.json` (normalized bounds + confidence + deterministic 4-edge rotation estimate)
-- `tmp/step01/debug.json` (raw vectors + chosen indices)
-- `tmp/step01/vertical_profile.csv`, `tmp/step01/horizontal_profile.csv`
-- `tmp/step01/vertical_profile_plot.jpg`, `tmp/step01/horizontal_profile_plot.jpg`
+- File selection:
+  - `Up/Down` move cursor
+  - `Space` toggle one file
+  - `a` select all
+  - `u` select all files without existing `.xmp`
+  - `n` clear selection
+- Outputs and preview mode:
+  - `x` toggle XMP sidecars
+  - `v` toggle preview JPEGs
+  - `p` cycle preview mode (`Overlay`, `Final Crop`, `Crop + Frame`)
+- Crop tuning:
+  - `-` / `=` adjust `Final Crop Scale` by `0.25%`
+  - `0` reset crop scale
+  - `,` / `.` adjust horizontal trim
+  - `;` / `'` adjust vertical trim
+  - `9` reset trim defaults
+- Run/cancel:
+  - `Enter` start
+  - `y` / `n` confirm/cancel XMP overwrite prompt
+  - `c` cancel active run
+  - `q` quit
 
-## Main TUI
+## Trim mode explained
 
-```bash
-cargo run --release -- .
-```
+`XMP Trim` is a normalized adjustment applied symmetrically on each axis:
 
-TUI flow:
-- scan RAWs from path
-- choose actions (previews / sidecar writes)
-- preview mode toggle:
-- `Overlay` (debug boxes)
-- `Final Crop` (clean cropped image)
-- `Crop + Frame` (final crop on white background with padding)
-- optional final crop scale percent (`0.00%` default, positive expands crop, negative shrinks)
-- optional XMP axis trims (H/V) for Lightroom crop tuning, with overlay visualization of adjusted crop
-- select subset of files
-- run in parallel with live progress
-- outputs previews to `previews/`
+- Horizontal trim moves both left and right crop edges.
+- Vertical trim moves both top and bottom crop edges.
+- Positive trim shrinks the crop inward.
+- Negative trim expands it outward.
 
-## Dev checks
+Defaults are:
 
-```bash
-cargo +nightly fmt
-cargo clippy --tests
-```
+- Horizontal trim: `+0.0000`
+- Vertical trim: `+0.0050`
 
-## GitHub workflows
+That default vertical trim is a small inward bias that often helps remove a little extra edge/border in real scans.
 
-- CI runs on pull requests and pushes to `main`:
-  - `cargo +nightly fmt --all -- --check`
-  - `cargo +stable check --all-targets --locked`
-  - `cargo +stable clippy --tests --locked`
-  - `cargo +stable test --locked`
-- Release runs when a tag matching `v*` is pushed (for example, `v0.1.0`).
-- The tag workflow verifies the tagged commit is on `main`, builds `croppy` for Linux/Windows/macOS, and attaches archives plus `SHA256SUMS.txt` to the GitHub Release.
+## Output behavior and safety
 
-Example release tag flow:
+- XMP output: `<raw_basename>.xmp` next to each RAW.
+- Preview output: `<out-dir>/previews/<raw_basename>.jpg`.
+- If XMP already exists, Croppy prompts before overwriting.
+- RAW source files are never modified.
 
-```bash
-git checkout main
-git pull
-git tag v0.1.0
-git push origin v0.1.0
-```
+## Limitations
+
+- Crops can be wrong on difficult frames, especially high-contrast black and white scans.
+- Crops are currently free-form and not constrained to a fixed `3:2` aspect ratio.
+- You should still do a quick manual review pass.
+
+## How it works (high level)
+
+- RAW decode with `libraw` bindings (`rsraw`/`rsraw-sys`).
+- Preprocess to improve edge contrast (grayscale, invert, levels, 180-degree normalization).
+- Detect frame bounds from image profiles/edge scans.
+- Optionally refine rotation from fitted edge lines.
+- Write Lightroom crop metadata (`CropLeft`, `CropTop`, `CropRight`, `CropBottom`, `CropAngle`) to XMP sidecars.
+
+No machine learning, no OpenCV, minimal dependencies.
+
+## Contributing
+
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
