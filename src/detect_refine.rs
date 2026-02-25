@@ -4,12 +4,18 @@ use imageproc::drawing::draw_line_segment_mut;
 use imageproc::geometric_transformations::{Interpolation, rotate_about_center};
 use serde::Serialize;
 
-use crate::detect::{BoundsNorm, Detection, detect_bounds_with_debug};
+use crate::detect::{BoundsNorm, Detection, detect_bounds};
 use crate::kernels::line_fit::{
     fit_line_x_of_y, fit_line_y_of_x, horizontal_fit_angle_deg, pick_rotation_angle,
     vertical_fit_angle_deg,
 };
 use crate::kernels::peak_pick::{pick_peak_x, pick_peak_y};
+
+#[cfg(feature = "debug-artifacts")]
+#[path = "detect_refine_debug.rs"]
+pub mod debug;
+#[cfg(feature = "debug-artifacts")]
+pub use debug::{RotationDebug, RotationLegend, rotation_debug_from_inner};
 
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct EdgeLineRotation {
@@ -24,38 +30,12 @@ pub struct EdgeLineRotation {
     pub points_right: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct RotationDebug {
-    pub summary: EdgeLineRotation,
-    pub inner_px: [i32; 4],
-    pub top_points: Vec<[f32; 2]>,
-    pub bottom_points: Vec<[f32; 2]>,
-    pub left_points: Vec<[f32; 2]>,
-    pub right_points: Vec<[f32; 2]>,
-    pub top_fit: Option<[f32; 2]>,    // y = m*x + b
-    pub bottom_fit: Option<[f32; 2]>, // y = m*x + b
-    pub left_fit: Option<[f32; 2]>,   // x = m*y + b
-    pub right_fit: Option<[f32; 2]>,  // x = m*y + b
-    pub legend: RotationLegend,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct RotationLegend {
-    pub top_points: &'static str,
-    pub bottom_points: &'static str,
-    pub left_points: &'static str,
-    pub right_points: &'static str,
-    pub top_line: &'static str,
-    pub bottom_line: &'static str,
-    pub left_line: &'static str,
-    pub right_line: &'static str,
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct RotationRefineConfig {
     pub refine_rotation: bool,
     pub apply_rotation_decision: bool,
     pub max_refine_abs_deg: f32,
+    pub collect_debug: bool,
 }
 
 impl Default for RotationRefineConfig {
@@ -64,6 +44,7 @@ impl Default for RotationRefineConfig {
             refine_rotation: true,
             apply_rotation_decision: true,
             max_refine_abs_deg: 3.0,
+            collect_debug: false,
         }
     }
 }
@@ -73,6 +54,7 @@ pub struct DetectRefineRun {
     pub detection_initial: Detection,
     pub detection_refined: Option<Detection>,
     pub detection: Detection,
+    #[cfg(feature = "debug-artifacts")]
     pub rotation_initial_debug: Option<RotationDebug>,
     pub rotation_estimate: Option<EdgeLineRotation>,
     pub rotation_applied_deg: Option<f32>,
@@ -83,9 +65,15 @@ pub fn run_detection_with_rotation_refine(
     gray: &GrayImage,
     refine_cfg: RotationRefineConfig,
 ) -> Option<DetectRefineRun> {
-    let (det, _dbg) = detect_bounds_with_debug(gray)?;
-    let rotation_initial = rotation_debug_from_inner(gray, det.inner);
-    let rotation_estimate = rotation_initial.as_ref().map(|d| d.summary);
+    let det = detect_bounds(gray)?;
+    let rotation_estimate = estimate_rotation_from_inner(gray, det.inner);
+
+    #[cfg(feature = "debug-artifacts")]
+    let rotation_initial_debug = if refine_cfg.collect_debug {
+        rotation_debug_from_inner(gray, det.inner)
+    } else {
+        None
+    };
 
     let mut final_detection = det;
     let mut refined_detection = None;
@@ -103,16 +91,14 @@ pub fn run_detection_with_rotation_refine(
         );
         let theta = apply_deg.to_radians();
         let rotated = rotate_about_center(gray, theta, Interpolation::Bilinear, Luma([0u8]));
-        if let Some((det2, _dbg2)) = detect_bounds_with_debug(&rotated)
+        if let Some(det2) = detect_bounds(&rotated)
             && refined_bounds_plausible(det.inner, det2.inner)
         {
             final_detection = det2;
             refined_detection = Some(det2);
             rotation_applied_deg = Some(apply_deg);
-            let rotation_refined_dbg = rotation_debug_from_inner(&rotated, det2.inner);
-            rotation_residual_deg = rotation_refined_dbg
-                .as_ref()
-                .map(|d| d.summary.angle_deg.abs());
+            rotation_residual_deg =
+                estimate_rotation_from_inner(&rotated, det2.inner).map(|r| r.angle_deg.abs());
         }
     }
 
@@ -120,59 +106,18 @@ pub fn run_detection_with_rotation_refine(
         detection_initial: det,
         detection_refined: refined_detection,
         detection: final_detection,
-        rotation_initial_debug: rotation_initial,
+        #[cfg(feature = "debug-artifacts")]
+        rotation_initial_debug,
         rotation_estimate,
         rotation_applied_deg,
         rotation_residual_deg,
     })
 }
 
-fn refined_bounds_plausible(initial: BoundsNorm, refined: BoundsNorm) -> bool {
-    let area_initial = bounds_area(initial).max(1e-6);
-    let area_refined = bounds_area(refined);
-    let area_growth = area_refined / area_initial;
-
-    let touches_refined = border_touch_count(refined, 0.01);
-    let touches_initial = border_touch_count(initial, 0.01);
-
-    if touches_refined >= 2 && touches_initial < 2 && area_growth > 1.10 {
-        return false;
-    }
-
-    if area_refined > 0.95 && area_growth > 1.25 {
-        return false;
-    }
-
-    true
-}
-
-fn bounds_area(b: BoundsNorm) -> f32 {
-    let w = (b.right - b.left).abs().clamp(0.0, 1.0);
-    let h = (b.bottom - b.top).abs().clamp(0.0, 1.0);
-    w * h
-}
-
-fn border_touch_count(b: BoundsNorm, margin: f32) -> usize {
-    let mut count = 0usize;
-    if b.left <= margin {
-        count += 1;
-    }
-    if b.top <= margin {
-        count += 1;
-    }
-    if (1.0 - b.right) <= margin {
-        count += 1;
-    }
-    if (1.0 - b.bottom) <= margin {
-        count += 1;
-    }
-    count
-}
-
-pub fn rotation_debug_from_inner(
-    gray: &image::GrayImage,
+pub fn estimate_rotation_from_inner(
+    gray: &GrayImage,
     inner: BoundsNorm,
-) -> Option<RotationDebug> {
+) -> Option<EdgeLineRotation> {
     let w = gray.width() as i32;
     let h = gray.height() as i32;
     if w < 32 || h < 32 {
@@ -239,38 +184,59 @@ pub fn rotation_debug_from_inner(
         right_fit.as_ref(),
     )?;
 
-    Some(RotationDebug {
-        summary: EdgeLineRotation {
-            angle_deg: angle,
-            top_deg,
-            bottom_deg,
-            left_deg,
-            right_deg,
-            points_top: top_raw.len(),
-            points_bottom: bottom_raw.len(),
-            points_left: left_raw.len(),
-            points_right: right_raw.len(),
-        },
-        inner_px: [x1, y1, x2, y2],
-        top_points: top_raw.iter().map(|(x, y)| [*x, *y]).collect(),
-        bottom_points: bottom_raw.iter().map(|(x, y)| [*x, *y]).collect(),
-        left_points: left_raw.iter().map(|(x, y)| [*x, *y]).collect(),
-        right_points: right_raw.iter().map(|(x, y)| [*x, *y]).collect(),
-        top_fit: top_fit.map(|f| [f.slope(), f.intercept()]),
-        bottom_fit: bottom_fit.map(|f| [f.slope(), f.intercept()]),
-        left_fit: left_fit.map(|f| [f.slope(), f.intercept()]),
-        right_fit: right_fit.map(|f| [f.slope(), f.intercept()]),
-        legend: RotationLegend {
-            top_points: "green points",
-            bottom_points: "cyan points",
-            left_points: "magenta points",
-            right_points: "orange points",
-            top_line: "green line",
-            bottom_line: "cyan line",
-            left_line: "magenta line",
-            right_line: "orange line",
-        },
+    Some(EdgeLineRotation {
+        angle_deg: angle,
+        top_deg,
+        bottom_deg,
+        left_deg,
+        right_deg,
+        points_top: top_raw.len(),
+        points_bottom: bottom_raw.len(),
+        points_left: left_raw.len(),
+        points_right: right_raw.len(),
     })
+}
+
+fn refined_bounds_plausible(initial: BoundsNorm, refined: BoundsNorm) -> bool {
+    let area_initial = bounds_area(initial).max(1e-6);
+    let area_refined = bounds_area(refined);
+    let area_growth = area_refined / area_initial;
+
+    let touches_refined = border_touch_count(refined, 0.01);
+    let touches_initial = border_touch_count(initial, 0.01);
+
+    if touches_refined >= 2 && touches_initial < 2 && area_growth > 1.10 {
+        return false;
+    }
+
+    if area_refined > 0.95 && area_growth > 1.25 {
+        return false;
+    }
+
+    true
+}
+
+fn bounds_area(b: BoundsNorm) -> f32 {
+    let w = (b.right - b.left).abs().clamp(0.0, 1.0);
+    let h = (b.bottom - b.top).abs().clamp(0.0, 1.0);
+    w * h
+}
+
+fn border_touch_count(b: BoundsNorm, margin: f32) -> usize {
+    let mut count = 0usize;
+    if b.left <= margin {
+        count += 1;
+    }
+    if b.top <= margin {
+        count += 1;
+    }
+    if (1.0 - b.right) <= margin {
+        count += 1;
+    }
+    if (1.0 - b.bottom) <= margin {
+        count += 1;
+    }
+    count
 }
 
 pub fn draw_norm_rect(img: &mut RgbImage, b: BoundsNorm, color: Rgb<u8>) {

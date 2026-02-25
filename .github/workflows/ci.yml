@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust-checks:
+    name: Rust Checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable toolchain (clippy)
+        run: rustup toolchain install stable --profile minimal --component clippy
+
+      - name: Install nightly toolchain (rustfmt)
+        run: rustup toolchain install nightly --profile minimal --component rustfmt
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo +nightly fmt --all -- --check
+
+      - name: Cargo check
+        run: cargo +stable check --all-targets --locked
+
+      - name: Clippy (tests)
+        run: cargo +stable clippy --tests --locked
+
+      - name: Run tests
+        run: cargo +stable test --locked

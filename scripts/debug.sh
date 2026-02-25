@@ -67,7 +67,7 @@ else
 fi
 
 echo "== Step 01 =="
-cargo run --release --example step01_prepare -- \
+cargo run --release --features debug-artifacts --example step01_prepare -- \
   "${RAW_DIR}" \
   --raw "${RAW_COPY}" \
   --out-dir "${STEP01_DIR}"
@@ -78,7 +78,7 @@ step02_args=(
   --out-dir "${STEP02_DIR}"
   --max-refine-abs-deg "${MAX_REFINE_ABS_DEG}"
 )
-cargo run --release --example step02_detect_stub -- "${step02_args[@]}"
+cargo run --release --features debug-artifacts --example step02_detect_stub -- "${step02_args[@]}"
 
 if is_true "${RUN_NO_REFINE_COMPARE}"; then
   echo "== Step 02 (no refine compare) =="
@@ -89,7 +89,7 @@ if is_true "${RUN_NO_REFINE_COMPARE}"; then
     # Force a no-op refine baseline by clamping applied correction to 0.
     --max-refine-abs-deg "0.0"
   )
-  cargo run --release --example step02_detect_stub -- "${step02_no_refine_args[@]}"
+  cargo run --release --features debug-artifacts --example step02_detect_stub -- "${step02_no_refine_args[@]}"
 fi
 
 echo
