@@ -1,7 +1,9 @@
 pub mod detect;
 pub mod detect_refine;
 pub mod discover;
+#[cfg(feature = "debug-artifacts")]
 pub mod handoff;
 pub mod kernels;
+pub mod pipeline;
 pub mod preprocess;
 pub mod raw;

@@ -1,6 +1,4 @@
 use std::io::{self, Stdout};
-#[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,14 +8,13 @@ use std::{fs, thread};
 
 use anyhow::{Result, anyhow};
 use clap::Parser;
-use croppy::detect::BoundsNorm;
-use croppy::detect_refine::{
-    DetectRefineRun, RotationRefineConfig, draw_norm_rect, draw_refined_inner_backproject,
-    rotate_rgb_about_center, run_detection_with_rotation_refine,
-};
 use croppy::discover::{is_supported_raw, list_raw_files};
-use croppy::preprocess::{PreprocessConfig, prepare_image, resize_rgb_max_edge};
-use croppy::raw::{decode_raw_to_rgb_with_hint, rgb_to_gray};
+use croppy::pipeline::{
+    CANCELLED_MARKER, FINAL_CROP_SCALE_FINE_STEP_PCT, PipelineOptions, PreviewMode,
+    XMP_HORIZONTAL_TRIM_DEFAULT, XMP_TRIM_STEP, XMP_VERTICAL_TRIM_DEFAULT,
+    adjust_final_crop_scale_pct, adjust_xmp_trim, clamp_xmp_trim, is_cancelled_message,
+    preview_dir, process_raw_file as process_pipeline_raw,
+};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -49,41 +46,6 @@ struct Args {
 }
 
 #[derive(Clone)]
-struct RunOptions {
-    write_xmp: bool,
-    write_preview: bool,
-    preview_mode: PreviewMode,
-    max_edge: u32,
-    out_dir: PathBuf,
-    final_crop_scale_pct: f32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PreviewMode {
-    DebugOverlay,
-    FinalCrop,
-    FinalCropFramed,
-}
-
-impl PreviewMode {
-    fn label(self) -> &'static str {
-        match self {
-            Self::DebugOverlay => "Overlay",
-            Self::FinalCrop => "Final Crop",
-            Self::FinalCropFramed => "Crop + Frame",
-        }
-    }
-
-    fn next(self) -> Self {
-        match self {
-            Self::DebugOverlay => Self::FinalCrop,
-            Self::FinalCrop => Self::FinalCropFramed,
-            Self::FinalCropFramed => Self::DebugOverlay,
-        }
-    }
-}
-
-#[derive(Clone)]
 struct FileResult {
     preview: Option<PathBuf>,
     xmp: Option<PathBuf>,
@@ -102,13 +64,7 @@ enum Screen {
     Running,
 }
 
-const PREVIEW_SUBDIR: &str = "previews";
-const CANCELLED_MARKER: &str = "__croppy_cancelled__";
-const FINAL_CROP_SCALE_MIN_PCT: f32 = -20.0;
-const FINAL_CROP_SCALE_MAX_PCT: f32 = 20.0;
-const FINAL_CROP_SCALE_FINE_STEP_PCT: f32 = 0.25;
-const FRAME_PAD_FRAC: f32 = 0.06;
-const FRAME_PAD_MIN_PX: u32 = 20;
+const RUN_PLAN_PANEL_WIDTH: u16 = 38;
 
 struct App {
     raws: Vec<PathBuf>,
@@ -117,6 +73,8 @@ struct App {
     write_preview: bool,
     preview_mode: PreviewMode,
     final_crop_scale_pct: f32,
+    horizontal_trim: f32,
+    vertical_trim: f32,
     screen: Screen,
     file_cursor: usize,
     progress_done: usize,
@@ -131,15 +89,6 @@ struct App {
     overwrite_prompt_count: Option<usize>,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct XmpCrop {
-    left: f32,
-    top: f32,
-    right: f32,
-    bottom: f32,
-    angle_deg: f32,
-}
-
 impl App {
     fn new(raws: Vec<PathBuf>) -> Self {
         let selected = vec![false; raws.len()];
@@ -150,6 +99,8 @@ impl App {
             write_preview: false,
             preview_mode: PreviewMode::DebugOverlay,
             final_crop_scale_pct: 0.0,
+            horizontal_trim: clamp_xmp_trim(XMP_HORIZONTAL_TRIM_DEFAULT),
+            vertical_trim: clamp_xmp_trim(XMP_VERTICAL_TRIM_DEFAULT),
             screen: Screen::Select,
             file_cursor: 0,
             progress_done: 0,
@@ -312,7 +263,10 @@ fn draw_select(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, app: &Ap
         .split(inner_area(area));
     let body = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(20), Constraint::Length(32)])
+        .constraints([
+            Constraint::Min(20),
+            Constraint::Length(RUN_PLAN_PANEL_WIDTH),
+        ])
         .split(chunks[1]);
     let selected_count = app.selected.iter().filter(|v| **v).count();
     let header = Paragraph::new(vec![
@@ -392,12 +346,36 @@ fn draw_select(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, app: &Ap
             Span::styled("[-]/[=] ", key_style()),
             Span::raw("+/-0.25%"),
         ]),
-        Line::from(vec![
-            Span::styled("[,]/[.] ", key_style()),
-            Span::raw("+/-0.25%"),
-        ]),
         Line::from(Span::styled(
             "Positive keeps more border.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "XMP Trim (normalized)",
+            Style::default().fg(Color::Gray),
+        )),
+        Line::from(vec![
+            Span::styled(
+                format!("H {:+.4}  V {:+.4}", app.horizontal_trim, app.vertical_trim),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled("[9]", key_style()),
+            Span::raw(" reset"),
+        ]),
+        Line::from(vec![
+            Span::styled("[,]/[.] ", key_style()),
+            Span::raw(format!("H +/-{:.4}", XMP_TRIM_STEP)),
+        ]),
+        Line::from(vec![
+            Span::styled("[;]/['] ", key_style()),
+            Span::raw(format!("V +/-{:.4}", XMP_TRIM_STEP)),
+        ]),
+        Line::from(Span::styled(
+            "Positive trim shrinks crop inward.",
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(""),
@@ -435,9 +413,13 @@ fn draw_select(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, app: &Ap
         Span::styled("[-]/[=]", key_style()),
         Span::raw(" crop-scale  "),
         Span::styled("[,]/[.]", key_style()),
-        Span::raw(" step  "),
+        Span::raw(" h-trim  "),
+        Span::styled("[;]/[']", key_style()),
+        Span::raw(" v-trim  "),
         Span::styled("0", key_style()),
-        Span::raw(" reset  "),
+        Span::raw(" reset-scale  "),
+        Span::styled("9", key_style()),
+        Span::raw(" reset-trim  "),
         Span::styled("y/n", key_style()),
         Span::raw(" confirm overwrite  "),
         Span::styled("Enter", key_style()),
@@ -531,10 +513,6 @@ fn key_style() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
-fn preview_dir(out_dir: &Path) -> PathBuf {
-    out_dir.join(PREVIEW_SUBDIR)
-}
-
 fn summarize_results(results: &[FileResult]) -> (usize, usize, usize) {
     let ok = results.iter().filter(|r| r.error.is_none()).count();
     let canceled = results.iter().filter(|r| is_canceled_result(r)).count();
@@ -605,14 +583,6 @@ fn inner_area(area: ratatui::layout::Rect) -> ratatui::layout::Rect {
     }
 }
 
-fn adjust_final_crop_scale_pct(current: f32, delta: f32) -> f32 {
-    clamp_final_crop_scale_pct(current + delta)
-}
-
-fn clamp_final_crop_scale_pct(value: f32) -> f32 {
-    value.clamp(FINAL_CROP_SCALE_MIN_PCT, FINAL_CROP_SCALE_MAX_PCT)
-}
-
 fn handle_select_key(app: &mut App, args: &Args, code: KeyCode) -> Result<bool> {
     if app.overwrite_prompt_count.is_some() {
         match code {
@@ -660,21 +630,28 @@ fn handle_select_key(app: &mut App, args: &Args, code: KeyCode) -> Result<bool> 
             app.select_notice = None;
         }
         KeyCode::Char(',') => {
-            app.final_crop_scale_pct = adjust_final_crop_scale_pct(
-                app.final_crop_scale_pct,
-                -FINAL_CROP_SCALE_FINE_STEP_PCT,
-            );
+            app.horizontal_trim = adjust_xmp_trim(app.horizontal_trim, -XMP_TRIM_STEP);
             app.select_notice = None;
         }
         KeyCode::Char('.') => {
-            app.final_crop_scale_pct = adjust_final_crop_scale_pct(
-                app.final_crop_scale_pct,
-                FINAL_CROP_SCALE_FINE_STEP_PCT,
-            );
+            app.horizontal_trim = adjust_xmp_trim(app.horizontal_trim, XMP_TRIM_STEP);
+            app.select_notice = None;
+        }
+        KeyCode::Char(';') => {
+            app.vertical_trim = adjust_xmp_trim(app.vertical_trim, -XMP_TRIM_STEP);
+            app.select_notice = None;
+        }
+        KeyCode::Char('\'') => {
+            app.vertical_trim = adjust_xmp_trim(app.vertical_trim, XMP_TRIM_STEP);
             app.select_notice = None;
         }
         KeyCode::Char('0') => {
             app.final_crop_scale_pct = 0.0;
+            app.select_notice = None;
+        }
+        KeyCode::Char('9') => {
+            app.horizontal_trim = clamp_xmp_trim(XMP_HORIZONTAL_TRIM_DEFAULT);
+            app.vertical_trim = clamp_xmp_trim(XMP_VERTICAL_TRIM_DEFAULT);
             app.select_notice = None;
         }
         KeyCode::Char(' ') => {
@@ -743,13 +720,15 @@ fn start_run(app: &mut App, args: &Args, overwrite_confirmed: bool) -> Result<()
     app.results.clear();
     app.cancel_requested = false;
     app.run_started_at = Some(Instant::now());
-    let opts = RunOptions {
+    let opts = PipelineOptions {
         write_xmp: app.write_xmp,
         write_preview: app.write_preview,
         preview_mode: app.preview_mode,
         max_edge: args.max_edge,
         out_dir: args.out_dir.clone(),
         final_crop_scale_pct: app.final_crop_scale_pct,
+        horizontal_trim: app.horizontal_trim,
+        vertical_trim: app.vertical_trim,
     };
     let cancel = Arc::new(AtomicBool::new(false));
     let rx = spawn_worker(files, opts, cancel.clone())?;
@@ -761,10 +740,12 @@ fn start_run(app: &mut App, args: &Args, overwrite_confirmed: bool) -> Result<()
 
 fn spawn_worker(
     files: Vec<PathBuf>,
-    opts: RunOptions,
+    opts: PipelineOptions,
     cancel: Arc<AtomicBool>,
 ) -> Result<Receiver<WorkerMsg>> {
-    fs::create_dir_all(preview_dir(&opts.out_dir))?;
+    if opts.write_preview {
+        fs::create_dir_all(preview_dir(&opts.out_dir))?;
+    }
     let (tx, rx) = mpsc::channel();
     let worker_count = thread::available_parallelism()
         .map(|n| n.get())
@@ -790,7 +771,7 @@ fn spawn_worker(
 
 fn process_raw_file(
     raw: PathBuf,
-    opts: &RunOptions,
+    opts: &PipelineOptions,
     tx: &Sender<WorkerMsg>,
     cancel: &AtomicBool,
 ) -> FileResult {
@@ -805,235 +786,27 @@ fn process_raw_file(
         error: None,
     };
 
-    let res = (|| -> Result<()> {
-        if cancel.load(Ordering::Relaxed) {
-            return Err(anyhow!(CANCELLED_MARKER));
-        }
-        let decoded = decode_raw_to_rgb_with_hint(&raw, opts.max_edge)?;
-        if let Some(warn) = decoded.warning {
-            let _ = tx.send(WorkerMsg::Started(format!("warning: {warn}")));
-        }
-        let rgb_full = decoded.image;
-        if cancel.load(Ordering::Relaxed) {
-            return Err(anyhow!(CANCELLED_MARKER));
-        }
-        let rgb = resize_rgb_max_edge(&rgb_full, opts.max_edge);
-        let gray = rgb_to_gray(&rgb);
-        let preprocess_cfg = PreprocessConfig {
-            invert: true,
-            flip_180: true,
-            black_pct: 2.0,
-            white_pct: 80.0,
-            knee_pct: 2.0,
-        };
-        let prepared = prepare_image(gray, preprocess_cfg);
-        if cancel.load(Ordering::Relaxed) {
-            return Err(anyhow!(CANCELLED_MARKER));
-        }
-        let prep_gray = rgb_to_gray(&prepared);
-        let refine = run_detection_with_rotation_refine(
-            &prep_gray,
-            RotationRefineConfig {
-                refine_rotation: true,
-                apply_rotation_decision: true,
-                max_refine_abs_deg: 3.0,
-            },
-        )
-        .ok_or_else(|| anyhow!("boundary detection failed"))?;
+    let res = process_pipeline_raw(&raw, opts, cancel);
 
-        if opts.write_preview {
-            if cancel.load(Ordering::Relaxed) {
-                return Err(anyhow!(CANCELLED_MARKER));
+    match res {
+        Ok(processed) => {
+            out.preview = processed.preview;
+            out.xmp = processed.xmp;
+            if let Some(warn) = processed.warning {
+                let _ = tx.send(WorkerMsg::Started(format!("warning: {warn}")));
             }
-            let preview_path = preview_path_for(&raw, &opts.out_dir);
-            guard_write_target(&raw, &preview_path, "preview")?;
-            match opts.preview_mode {
-                PreviewMode::DebugOverlay => write_overlay_preview(
-                    &prepared,
-                    &refine,
-                    opts.final_crop_scale_pct,
-                    &preview_path,
-                )?,
-                PreviewMode::FinalCrop => write_final_crop_preview(
-                    &prepared,
-                    &refine,
-                    opts.final_crop_scale_pct,
-                    &preview_path,
-                )?,
-                PreviewMode::FinalCropFramed => write_framed_final_crop_preview(
-                    &prepared,
-                    &refine,
-                    opts.final_crop_scale_pct,
-                    &preview_path,
-                )?,
-            }
-            out.preview = Some(preview_path);
         }
-
-        if opts.write_xmp {
-            if cancel.load(Ordering::Relaxed) {
-                return Err(anyhow!(CANCELLED_MARKER));
+        Err(e) => {
+            let message = e.to_string();
+            if is_cancelled_message(&message) {
+                out = canceled_result();
+            } else {
+                out.error = Some(message);
             }
-            let xmp_crop = xmp_crop_from_detection(
-                refine.detection.inner,
-                refine.rotation_applied_deg,
-                preprocess_cfg.flip_180,
-                opts.final_crop_scale_pct,
-            );
-            let xmp_path = raw.with_extension("xmp");
-            guard_write_target(&raw, &xmp_path, "xmp sidecar")?;
-            write_xmp_sidecar(
-                &xmp_path,
-                xmp_crop.left,
-                xmp_crop.top,
-                xmp_crop.right,
-                xmp_crop.bottom,
-                xmp_crop.angle_deg,
-            )?;
-            out.xmp = Some(xmp_path);
-        }
-        Ok(())
-    })();
-
-    if let Err(e) = res {
-        if e.to_string() == CANCELLED_MARKER {
-            out = canceled_result();
-        } else {
-            out.error = Some(e.to_string());
         }
     }
+
     out
-}
-
-fn preview_path_for(raw: &Path, out_dir: &Path) -> PathBuf {
-    let mut base = raw
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("preview")
-        .to_string();
-    base.push_str(".jpg");
-    preview_dir(out_dir).join(base)
-}
-
-fn write_overlay_preview(
-    prepared: &image::RgbImage,
-    refine: &DetectRefineRun,
-    final_crop_scale_pct: f32,
-    preview_path: &Path,
-) -> Result<()> {
-    let mut overlay = prepared.clone();
-    draw_norm_rect(
-        &mut overlay,
-        refine.detection_initial.inner,
-        image::Rgb([255, 255, 0]),
-    );
-    if let (Some(refined_det), Some(applied_deg)) =
-        (refine.detection_refined, refine.rotation_applied_deg)
-    {
-        draw_refined_inner_backproject(
-            &mut overlay,
-            refined_det.inner,
-            applied_deg.to_radians(),
-            image::Rgb([80, 255, 255]),
-        );
-    }
-    if final_crop_scale_pct.abs() > f32::EPSILON {
-        let (final_inner, theta_opt) = final_preview_inner_bounds(refine, final_crop_scale_pct);
-        if let Some(theta) = theta_opt {
-            draw_refined_inner_backproject(
-                &mut overlay,
-                final_inner,
-                theta,
-                image::Rgb([120, 255, 120]),
-            );
-        } else {
-            draw_norm_rect(&mut overlay, final_inner, image::Rgb([120, 255, 120]));
-        }
-    }
-    overlay.save_with_format(preview_path, image::ImageFormat::Jpeg)?;
-    Ok(())
-}
-
-fn write_final_crop_preview(
-    prepared: &image::RgbImage,
-    refine: &DetectRefineRun,
-    final_crop_scale_pct: f32,
-    preview_path: &Path,
-) -> Result<()> {
-    let crop = render_final_crop_image(prepared, refine, final_crop_scale_pct);
-    crop.save_with_format(preview_path, image::ImageFormat::Jpeg)?;
-    Ok(())
-}
-
-fn write_framed_final_crop_preview(
-    prepared: &image::RgbImage,
-    refine: &DetectRefineRun,
-    final_crop_scale_pct: f32,
-    preview_path: &Path,
-) -> Result<()> {
-    let crop = render_final_crop_image(prepared, refine, final_crop_scale_pct);
-    let framed = render_crop_with_white_frame(&crop);
-    framed.save_with_format(preview_path, image::ImageFormat::Jpeg)?;
-    Ok(())
-}
-
-fn final_preview_inner_bounds(
-    refine: &DetectRefineRun,
-    final_crop_scale_pct: f32,
-) -> (BoundsNorm, Option<f32>) {
-    if let (Some(refined_det), Some(applied_deg)) =
-        (refine.detection_refined, refine.rotation_applied_deg)
-    {
-        let scaled =
-            scale_bounds_about_center(normalize_bounds(refined_det.inner), final_crop_scale_pct);
-        (scaled, Some(applied_deg.to_radians()))
-    } else {
-        let scaled = scale_bounds_about_center(
-            normalize_bounds(refine.detection.inner),
-            final_crop_scale_pct,
-        );
-        (scaled, None)
-    }
-}
-
-fn render_final_crop_image(
-    prepared: &image::RgbImage,
-    refine: &DetectRefineRun,
-    final_crop_scale_pct: f32,
-) -> image::RgbImage {
-    let (final_inner, theta_opt) = final_preview_inner_bounds(refine, final_crop_scale_pct);
-    if let Some(theta) = theta_opt {
-        let rotated = rotate_rgb_about_center(prepared, theta);
-        extract_norm_crop(&rotated, final_inner)
-    } else {
-        extract_norm_crop(prepared, final_inner)
-    }
-}
-
-fn extract_norm_crop(img: &image::RgbImage, b: BoundsNorm) -> image::RgbImage {
-    let w = img.width() as f32;
-    let h = img.height() as f32;
-    let x1 = (b.left * w).round().clamp(0.0, w - 1.0) as u32;
-    let x2 = (b.right * w).round().clamp(0.0, w) as u32;
-    let y1 = (b.top * h).round().clamp(0.0, h - 1.0) as u32;
-    let y2 = (b.bottom * h).round().clamp(0.0, h) as u32;
-    let cw = x2.saturating_sub(x1).max(1);
-    let ch = y2.saturating_sub(y1).max(1);
-    image::imageops::crop_imm(img, x1, y1, cw, ch).to_image()
-}
-
-fn render_crop_with_white_frame(crop: &image::RgbImage) -> image::RgbImage {
-    let pad_x = ((crop.width() as f32 * FRAME_PAD_FRAC).round() as u32).max(FRAME_PAD_MIN_PX);
-    let pad_y = ((crop.height() as f32 * FRAME_PAD_FRAC).round() as u32).max(FRAME_PAD_MIN_PX);
-    let out_w = crop.width().saturating_add(pad_x.saturating_mul(2)).max(1);
-    let out_h = crop.height().saturating_add(pad_y.saturating_mul(2)).max(1);
-    let mut framed = image::RgbImage::from_pixel(out_w, out_h, image::Rgb([255, 255, 255]));
-
-    for (x, y, px) in crop.enumerate_pixels() {
-        framed.put_pixel(x + pad_x, y + pad_y, *px);
-    }
-
-    framed
 }
 
 fn canceled_result() -> FileResult {
@@ -1041,306 +814,5 @@ fn canceled_result() -> FileResult {
         preview: None,
         xmp: None,
         error: Some(CANCELLED_MARKER.to_string()),
-    }
-}
-
-fn xmp_crop_from_detection(
-    inner_detected: BoundsNorm,
-    rotation_applied_deg: Option<f32>,
-    preprocess_flip_180: bool,
-    final_crop_scale_pct: f32,
-) -> XmpCrop {
-    let mut bounds = inner_detected;
-    if preprocess_flip_180 {
-        // Detection runs in a frame rotated 180 degrees; mirror bounds back so
-        // sidecar geometry matches RAW orientation. CropAngle sign conversion is
-        // handled separately below.
-        bounds = rotate_bounds_180(bounds);
-    }
-    bounds = normalize_bounds(bounds);
-    bounds = scale_bounds_about_center(bounds, final_crop_scale_pct);
-    XmpCrop {
-        left: bounds.left,
-        top: bounds.top,
-        right: bounds.right,
-        bottom: bounds.bottom,
-        // Internal refine rotates image pixels by `rotation_applied_deg`, while
-        // Lightroom's CropAngle uses the opposite sign convention.
-        angle_deg: -rotation_applied_deg.unwrap_or(0.0),
-    }
-}
-
-fn rotate_bounds_180(b: BoundsNorm) -> BoundsNorm {
-    BoundsNorm {
-        left: 1.0 - b.right,
-        top: 1.0 - b.bottom,
-        right: 1.0 - b.left,
-        bottom: 1.0 - b.top,
-    }
-}
-
-fn normalize_bounds(b: BoundsNorm) -> BoundsNorm {
-    let mut left = b.left.clamp(0.0, 1.0);
-    let mut right = b.right.clamp(0.0, 1.0);
-    let mut top = b.top.clamp(0.0, 1.0);
-    let mut bottom = b.bottom.clamp(0.0, 1.0);
-    if left > right {
-        std::mem::swap(&mut left, &mut right);
-    }
-    if top > bottom {
-        std::mem::swap(&mut top, &mut bottom);
-    }
-    BoundsNorm {
-        left,
-        top,
-        right,
-        bottom,
-    }
-}
-
-fn scale_bounds_about_center(bounds: BoundsNorm, scale_pct: f32) -> BoundsNorm {
-    let scale_pct = clamp_final_crop_scale_pct(scale_pct);
-    let scale = (1.0 + (scale_pct / 100.0)).max(0.01);
-
-    let cx = (bounds.left + bounds.right) * 0.5;
-    let cy = (bounds.top + bounds.bottom) * 0.5;
-    let half_w = (bounds.right - bounds.left).abs() * 0.5 * scale;
-    let half_h = (bounds.bottom - bounds.top).abs() * 0.5 * scale;
-
-    normalize_bounds(BoundsNorm {
-        left: cx - half_w,
-        top: cy - half_h,
-        right: cx + half_w,
-        bottom: cy + half_h,
-    })
-}
-
-fn guard_write_target(raw: &Path, target: &Path, output_kind: &str) -> Result<()> {
-    if raw == target {
-        return Err(anyhow!(
-            "refusing to write {output_kind}: target path equals source RAW path ({})",
-            raw.display()
-        ));
-    }
-    if is_supported_raw(target) {
-        return Err(anyhow!(
-            "refusing to write {output_kind}: target has RAW extension ({})",
-            target.display()
-        ));
-    }
-
-    let raw_abs = fs::canonicalize(raw).unwrap_or_else(|_| raw.to_path_buf());
-    let target_abs = fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
-    if raw_abs == target_abs {
-        return Err(anyhow!(
-            "refusing to write {output_kind}: target resolves to source RAW path ({})",
-            target.display()
-        ));
-    }
-
-    if let (Ok(raw_meta), Ok(target_meta)) = (fs::metadata(raw), fs::metadata(target)) {
-        #[cfg(unix)]
-        {
-            if raw_meta.dev() == target_meta.dev() && raw_meta.ino() == target_meta.ino() {
-                return Err(anyhow!(
-                    "refusing to write {output_kind}: target points to same file inode as source RAW ({})",
-                    target.display()
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn write_xmp_sidecar(
-    path: &Path,
-    left: f32,
-    top: f32,
-    right: f32,
-    bottom: f32,
-    angle_deg: f32,
-) -> Result<()> {
-    let xmp = format!(
-        concat!(
-            "<?xpacket begin=\"\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n",
-            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n",
-            " <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n",
-            "  <rdf:Description rdf:about=\"\"\n",
-            "    xmlns:crs=\"http://ns.adobe.com/camera-raw-settings/1.0/\"\n",
-            "    crs:HasCrop=\"True\"\n",
-            "    crs:CropConstrainAspectRatio=\"True\"\n",
-            "    crs:CropLeft=\"{left:.6}\"\n",
-            "    crs:CropTop=\"{top:.6}\"\n",
-            "    crs:CropRight=\"{right:.6}\"\n",
-            "    crs:CropBottom=\"{bottom:.6}\"\n",
-            "    crs:CropAngle=\"{angle:.6}\" />\n",
-            " </rdf:RDF>\n",
-            "</x:xmpmeta>\n",
-            "<?xpacket end=\"w\"?>\n"
-        ),
-        left = left,
-        top = top,
-        right = right,
-        bottom = bottom,
-        angle = angle_deg
-    );
-    fs::write(path, xmp)?;
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{BoundsNorm, PreviewMode, xmp_crop_from_detection};
-
-    fn assert_close(actual: f32, expected: f32) {
-        assert!(
-            (actual - expected).abs() < 1e-6,
-            "expected {expected}, got {actual}"
-        );
-    }
-
-    #[test]
-    fn xmp_crop_keeps_bounds_without_flip() {
-        let out = xmp_crop_from_detection(
-            BoundsNorm {
-                left: 0.1,
-                top: 0.2,
-                right: 0.8,
-                bottom: 0.9,
-            },
-            Some(-0.5),
-            false,
-            0.0,
-        );
-        assert_close(out.left, 0.1);
-        assert_close(out.top, 0.2);
-        assert_close(out.right, 0.8);
-        assert_close(out.bottom, 0.9);
-        assert_close(out.angle_deg, 0.5);
-    }
-
-    #[test]
-    fn xmp_crop_mirrors_bounds_when_preprocess_flipped() {
-        let out = xmp_crop_from_detection(
-            BoundsNorm {
-                left: 0.1,
-                top: 0.2,
-                right: 0.8,
-                bottom: 0.9,
-            },
-            Some(1.25),
-            true,
-            0.0,
-        );
-        assert_close(out.left, 0.2);
-        assert_close(out.top, 0.1);
-        assert_close(out.right, 0.9);
-        assert_close(out.bottom, 0.8);
-        assert_close(out.angle_deg, -1.25);
-    }
-
-    #[test]
-    fn xmp_crop_clamps_and_normalizes_bounds() {
-        let out = xmp_crop_from_detection(
-            BoundsNorm {
-                left: 1.2,
-                top: 0.9,
-                right: -0.1,
-                bottom: 0.2,
-            },
-            None,
-            false,
-            0.0,
-        );
-        assert_close(out.left, 0.0);
-        assert_close(out.top, 0.2);
-        assert_close(out.right, 1.0);
-        assert_close(out.bottom, 0.9);
-        assert_close(out.angle_deg, 0.0);
-    }
-
-    #[test]
-    fn xmp_crop_expands_around_center() {
-        let out = xmp_crop_from_detection(
-            BoundsNorm {
-                left: 0.2,
-                top: 0.3,
-                right: 0.8,
-                bottom: 0.7,
-            },
-            None,
-            false,
-            10.0,
-        );
-        assert_close(out.left, 0.17);
-        assert_close(out.top, 0.28);
-        assert_close(out.right, 0.83);
-        assert_close(out.bottom, 0.72);
-        assert_close(out.angle_deg, 0.0);
-    }
-
-    #[test]
-    fn xmp_crop_shrinks_around_center() {
-        let out = xmp_crop_from_detection(
-            BoundsNorm {
-                left: 0.2,
-                top: 0.3,
-                right: 0.8,
-                bottom: 0.7,
-            },
-            None,
-            false,
-            -10.0,
-        );
-        assert_close(out.left, 0.23);
-        assert_close(out.top, 0.32);
-        assert_close(out.right, 0.77);
-        assert_close(out.bottom, 0.68);
-        assert_close(out.angle_deg, 0.0);
-    }
-
-    #[test]
-    fn xmp_crop_scale_is_clamped() {
-        let out = xmp_crop_from_detection(
-            BoundsNorm {
-                left: 0.2,
-                top: 0.3,
-                right: 0.8,
-                bottom: 0.7,
-            },
-            None,
-            false,
-            100.0,
-        );
-        assert_close(out.left, 0.14);
-        assert_close(out.top, 0.26);
-        assert_close(out.right, 0.86);
-        assert_close(out.bottom, 0.74);
-    }
-
-    #[test]
-    fn preview_mode_cycles() {
-        assert_eq!(PreviewMode::DebugOverlay.next(), PreviewMode::FinalCrop);
-        assert_eq!(PreviewMode::FinalCrop.next(), PreviewMode::FinalCropFramed);
-        assert_eq!(
-            PreviewMode::FinalCropFramed.next(),
-            PreviewMode::DebugOverlay
-        );
-    }
-
-    #[test]
-    fn framed_crop_adds_white_border_area() {
-        let crop = image::RgbImage::from_pixel(100, 50, image::Rgb([12, 34, 56]));
-        let framed = super::render_crop_with_white_frame(&crop);
-        let pad_x = ((crop.width() as f32 * super::FRAME_PAD_FRAC).round() as u32)
-            .max(super::FRAME_PAD_MIN_PX);
-        let pad_y = ((crop.height() as f32 * super::FRAME_PAD_FRAC).round() as u32)
-            .max(super::FRAME_PAD_MIN_PX);
-        assert!(framed.width() > crop.width());
-        assert!(framed.height() > crop.height());
-        // Top-left remains background white.
-        assert_eq!(*framed.get_pixel(0, 0), image::Rgb([255, 255, 255]));
-        // The crop is pasted directly with no synthetic border stroke.
-        assert_eq!(*framed.get_pixel(pad_x, pad_y), image::Rgb([12, 34, 56]));
     }
 }

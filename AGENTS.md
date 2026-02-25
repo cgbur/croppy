@@ -21,12 +21,12 @@ CASE_DIR="tmp/cases/${CASE_ID}"
 mkdir -p "${CASE_DIR}/raw" "${CASE_DIR}/step01" "${CASE_DIR}/step02"
 cp -f "${RAW_SRC}" "${CASE_DIR}/raw/${CASE_ID}.ARW"
 
-cargo run --release --example step01_prepare -- \
+cargo run --release --features debug-artifacts --example step01_prepare -- \
   "${CASE_DIR}/raw" \
   --raw "${CASE_DIR}/raw/${CASE_ID}.ARW" \
   --out-dir "${CASE_DIR}/step01"
 
-cargo run --release --example step02_detect_stub -- \
+cargo run --release --features debug-artifacts --example step02_detect_stub -- \
   --input "${CASE_DIR}/step01/next.json" \
   --out-dir "${CASE_DIR}/step02"
 ```

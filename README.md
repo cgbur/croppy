@@ -13,7 +13,7 @@ This repo has:
 - optional 180-degree flip
 
 ```bash
-cargo run --release --example step01_prepare -- \
+cargo run --release --features debug-artifacts --example step01_prepare -- \
   /path/to/raw/folder \
   --recursive \
   --out-dir tmp/step01
@@ -31,7 +31,7 @@ Useful flags:
 2. Run boundary detection on prepared image:
 
 ```bash
-cargo run --release --example step02_detect_stub -- \
+cargo run --release --features debug-artifacts --example step02_detect_stub -- \
   --input tmp/step01/next.json
 ```
 
@@ -81,6 +81,7 @@ TUI flow:
 - `Final Crop` (clean cropped image)
 - `Crop + Frame` (final crop on white background with padding)
 - optional final crop scale percent (`0.00%` default, positive expands crop, negative shrinks)
+- optional XMP axis trims (H/V) for Lightroom crop tuning, with overlay visualization of adjusted crop
 - select subset of files
 - run in parallel with live progress
 - outputs previews to `previews/`
@@ -90,4 +91,23 @@ TUI flow:
 ```bash
 cargo +nightly fmt
 cargo clippy --tests
+```
+
+## GitHub workflows
+
+- CI runs on pull requests and pushes to `main`:
+  - `cargo +nightly fmt --all -- --check`
+  - `cargo +stable check --all-targets --locked`
+  - `cargo +stable clippy --tests --locked`
+  - `cargo +stable test --locked`
+- Release runs when a tag matching `v*` is pushed (for example, `v0.1.0`).
+- The tag workflow verifies the tagged commit is on `main`, builds `croppy` for Linux/Windows/macOS, and attaches archives plus `SHA256SUMS.txt` to the GitHub Release.
+
+Example release tag flow:
+
+```bash
+git checkout main
+git pull
+git tag v0.1.0
+git push origin v0.1.0
 ```

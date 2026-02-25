@@ -105,6 +105,7 @@ fn main() -> Result<()> {
         refine_rotation: args.refine_rotation,
         apply_rotation_decision: args.apply_rotation_decision,
         max_refine_abs_deg: args.max_refine_abs_deg,
+        collect_debug: args.dump_debug,
     };
 
     let t_detect_refine = Instant::now();
