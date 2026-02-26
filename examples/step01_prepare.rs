@@ -6,8 +6,8 @@ use anyhow::{Result, anyhow};
 use clap::Parser;
 use croppy::discover::{is_supported_raw, list_raw_files};
 use croppy::handoff::{Step01Handoff, Step01Transform, write_handoff};
-use croppy::preprocess::{PreprocessConfig, prepare_image, resize_rgb_max_edge};
-use croppy::raw::{decode_raw_to_rgb_with_hint, rgb_to_gray};
+use croppy::preprocess::{PreprocessConfig, prepare_image, resize_rgb_max_edge_owned};
+use croppy::raw::decode_raw_to_rgb_with_hint;
 use image::ImageFormat;
 use rand::prelude::IndexedRandom;
 
@@ -82,7 +82,7 @@ fn main() -> Result<()> {
     let rgb_full = decoded.image;
     let (raw_w, raw_h) = rgb_full.dimensions();
     let t_resize = Instant::now();
-    let rgb = resize_rgb_max_edge(&rgb_full, args.max_edge);
+    let rgb = resize_rgb_max_edge_owned(rgb_full, args.max_edge);
     let dt_resize = t_resize.elapsed();
     let (w, h) = rgb.dimensions();
     println!(
@@ -101,7 +101,7 @@ fn main() -> Result<()> {
     }
 
     let t_preprocess = Instant::now();
-    let gray = rgb_to_gray(&rgb);
+    let gray = image::imageops::grayscale(&rgb);
     let prepared = prepare_image(
         gray,
         PreprocessConfig {

@@ -5,15 +5,17 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Result, anyhow};
+use image::{GrayImage, Luma};
+use imageproc::geometric_transformations::{Interpolation, rotate_about_center};
 
 use crate::detect::BoundsNorm;
 use crate::detect_refine::{
     DetectRefineRun, RotationRefineConfig, draw_norm_rect, draw_refined_inner_backproject,
-    rotate_rgb_about_center, run_detection_with_rotation_refine,
+    run_detection_with_rotation_refine,
 };
 use crate::discover::is_supported_raw;
-use crate::preprocess::{PreprocessConfig, prepare_image, resize_rgb_max_edge};
-use crate::raw::{decode_raw_to_rgb_with_hint, rgb_to_gray};
+use crate::preprocess::{PreprocessConfig, prepare_image, resize_rgb_max_edge_owned};
+use crate::raw::decode_raw_to_rgb_with_hint;
 
 pub const PREVIEW_SUBDIR: &str = "previews";
 pub const CANCELLED_MARKER: &str = "__croppy_cancelled__";
@@ -116,13 +118,11 @@ pub fn process_raw_file(
 
     let decoded = decode_raw_to_rgb_with_hint(raw, opts.max_edge)?;
     let warning = decoded.warning;
-    let rgb_full = decoded.image;
+    let rgb = resize_rgb_max_edge_owned(decoded.image, opts.max_edge);
     if cancel.load(Ordering::Relaxed) {
         return Err(anyhow!(CANCELLED_MARKER));
     }
-
-    let rgb = resize_rgb_max_edge(&rgb_full, opts.max_edge);
-    let gray = rgb_to_gray(&rgb);
+    let gray = image::imageops::grayscale(&rgb);
     let preprocess_cfg = PreprocessConfig {
         invert: true,
         flip_180: true,
@@ -135,8 +135,7 @@ pub fn process_raw_file(
         return Err(anyhow!(CANCELLED_MARKER));
     }
 
-    let prep_gray = rgb_to_gray(&prepared);
-    let refine = run_detection_with_rotation_refine(&prep_gray, RotationRefineConfig::default())
+    let refine = run_detection_with_rotation_refine(&prepared, RotationRefineConfig::default())
         .ok_or_else(|| anyhow!("boundary detection failed"))?;
 
     let mut out = ProcessOutput {
@@ -225,14 +224,14 @@ fn preview_path_for(raw: &Path, out_dir: &Path) -> PathBuf {
 }
 
 fn write_overlay_preview(
-    prepared: &image::RgbImage,
+    prepared: &GrayImage,
     refine: &DetectRefineRun,
     final_crop_scale_pct: f32,
     horizontal_trim: f32,
     vertical_trim: f32,
     preview_path: &Path,
 ) -> Result<()> {
-    let mut overlay = prepared.clone();
+    let mut overlay = gray_to_rgb(prepared);
     draw_norm_rect(
         &mut overlay,
         refine.detection_initial.inner,
@@ -274,7 +273,7 @@ fn write_overlay_preview(
 }
 
 fn write_final_crop_preview(
-    prepared: &image::RgbImage,
+    prepared: &GrayImage,
     refine: &DetectRefineRun,
     final_crop_scale_pct: f32,
     horizontal_trim: f32,
@@ -288,12 +287,12 @@ fn write_final_crop_preview(
         horizontal_trim,
         vertical_trim,
     );
-    crop.save_with_format(preview_path, image::ImageFormat::Jpeg)?;
+    gray_to_rgb(&crop).save_with_format(preview_path, image::ImageFormat::Jpeg)?;
     Ok(())
 }
 
 fn write_framed_final_crop_preview(
-    prepared: &image::RgbImage,
+    prepared: &GrayImage,
     refine: &DetectRefineRun,
     final_crop_scale_pct: f32,
     horizontal_trim: f32,
@@ -308,7 +307,7 @@ fn write_framed_final_crop_preview(
         vertical_trim,
     );
     let framed = render_crop_with_white_frame(&crop);
-    framed.save_with_format(preview_path, image::ImageFormat::Jpeg)?;
+    gray_to_rgb(&framed).save_with_format(preview_path, image::ImageFormat::Jpeg)?;
     Ok(())
 }
 
@@ -340,23 +339,23 @@ fn final_preview_inner_bounds(
 }
 
 fn render_final_crop_image(
-    prepared: &image::RgbImage,
+    prepared: &GrayImage,
     refine: &DetectRefineRun,
     final_crop_scale_pct: f32,
     horizontal_trim: f32,
     vertical_trim: f32,
-) -> image::RgbImage {
+) -> GrayImage {
     let (final_inner, theta_opt) =
         final_preview_inner_bounds(refine, final_crop_scale_pct, horizontal_trim, vertical_trim);
     if let Some(theta) = theta_opt {
-        let rotated = rotate_rgb_about_center(prepared, theta);
+        let rotated = rotate_about_center(prepared, theta, Interpolation::Bilinear, Luma([0u8]));
         extract_norm_crop(&rotated, final_inner)
     } else {
         extract_norm_crop(prepared, final_inner)
     }
 }
 
-fn extract_norm_crop(img: &image::RgbImage, b: BoundsNorm) -> image::RgbImage {
+fn extract_norm_crop(img: &GrayImage, b: BoundsNorm) -> GrayImage {
     let w = img.width() as f32;
     let h = img.height() as f32;
     let x1 = (b.left * w).round().clamp(0.0, w - 1.0) as u32;
@@ -368,18 +367,27 @@ fn extract_norm_crop(img: &image::RgbImage, b: BoundsNorm) -> image::RgbImage {
     image::imageops::crop_imm(img, x1, y1, cw, ch).to_image()
 }
 
-fn render_crop_with_white_frame(crop: &image::RgbImage) -> image::RgbImage {
+fn render_crop_with_white_frame(crop: &GrayImage) -> GrayImage {
     let pad_x = ((crop.width() as f32 * FRAME_PAD_FRAC).round() as u32).max(FRAME_PAD_MIN_PX);
     let pad_y = ((crop.height() as f32 * FRAME_PAD_FRAC).round() as u32).max(FRAME_PAD_MIN_PX);
     let out_w = crop.width().saturating_add(pad_x.saturating_mul(2)).max(1);
     let out_h = crop.height().saturating_add(pad_y.saturating_mul(2)).max(1);
-    let mut framed = image::RgbImage::from_pixel(out_w, out_h, image::Rgb([255, 255, 255]));
+    let mut framed = GrayImage::from_pixel(out_w, out_h, Luma([255]));
 
     for (x, y, px) in crop.enumerate_pixels() {
         framed.put_pixel(x + pad_x, y + pad_y, *px);
     }
 
     framed
+}
+
+fn gray_to_rgb(img: &GrayImage) -> image::RgbImage {
+    let mut out = image::RgbImage::new(img.width(), img.height());
+    for (x, y, px) in img.enumerate_pixels() {
+        let v = px[0];
+        out.put_pixel(x, y, image::Rgb([v, v, v]));
+    }
+    out
 }
 
 fn xmp_crop_from_detection(
@@ -567,6 +575,8 @@ fn write_xmp_sidecar(
 
 #[cfg(test)]
 mod tests {
+    use image::{GrayImage, Luma};
+
     use super::{BoundsNorm, PreviewMode, xmp_crop_from_detection};
 
     fn assert_close(actual: f32, expected: f32) {
@@ -761,7 +771,7 @@ mod tests {
 
     #[test]
     fn framed_crop_adds_white_border_area() {
-        let crop = image::RgbImage::from_pixel(100, 50, image::Rgb([12, 34, 56]));
+        let crop = GrayImage::from_pixel(100, 50, Luma([56]));
         let framed = super::render_crop_with_white_frame(&crop);
         let pad_x = ((crop.width() as f32 * super::FRAME_PAD_FRAC).round() as u32)
             .max(super::FRAME_PAD_MIN_PX);
@@ -769,7 +779,7 @@ mod tests {
             .max(super::FRAME_PAD_MIN_PX);
         assert!(framed.width() > crop.width());
         assert!(framed.height() > crop.height());
-        assert_eq!(*framed.get_pixel(0, 0), image::Rgb([255, 255, 255]));
-        assert_eq!(*framed.get_pixel(pad_x, pad_y), image::Rgb([12, 34, 56]));
+        assert_eq!(*framed.get_pixel(0, 0), Luma([255]));
+        assert_eq!(*framed.get_pixel(pad_x, pad_y), Luma([56]));
     }
 }

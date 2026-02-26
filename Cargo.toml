@@ -7,6 +7,7 @@ publish = false
 [features]
 default = []
 debug-artifacts = ["dep:serde_json"]
+inner-parallelism = ["image/rayon", "imageproc/rayon"]
 
 [dependencies]
 # Core errors and CLI argument parsing.
@@ -18,8 +19,10 @@ crossterm = "0.29.0"
 ratatui = "0.29.0"
 
 # RAW decode and image processing for detection + debug outputs.
-image = "0.25.6"
-imageproc = "0.25.0"
+image = { version = "0.25.6", default-features = false, features = [
+    "default-formats",
+] }
+imageproc = { version = "0.25.0", default-features = false }
 rsraw = "0.1.0"
 rsraw-sys = "0.1.0"
 
