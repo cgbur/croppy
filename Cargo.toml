@@ -4,6 +4,13 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
 [features]
 default = []
 debug-artifacts = ["dep:serde_json"]
@@ -19,6 +26,7 @@ crossterm = "0.29.0"
 ratatui = "0.29.0"
 
 # RAW decode and image processing for detection + debug outputs.
+# Keep image/imageproc internal rayon disabled; we parallelize across files, and nested pools can hurt throughput.
 image = { version = "0.25.6", default-features = false, features = [
     "default-formats",
 ] }
