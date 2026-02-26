@@ -35,9 +35,10 @@ Croppy does **not** modify, delete, or rewrite your RAW files.
 2. Download the asset for your platform:
 - Linux x86_64: `croppy-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz`
 - macOS (Apple Silicon): `croppy-vX.Y.Z-aarch64-apple-darwin.tar.gz`
-- Windows x86_64: `croppy-vX.Y.Z-x86_64-pc-windows-msvc.zip`
 3. Extract the archive.
 4. Move the binary into a directory on your `PATH`.
+
+Windows release assets are temporarily disabled while `rsraw`/`rsraw-sys` Windows builds are being resolved.
 
 Linux / macOS example:
 
@@ -52,12 +53,6 @@ If needed, add to shell profile (`~/.bashrc` or `~/.zshrc`):
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
 ```
-
-Windows example:
-
-1. Extract `croppy.exe`.
-2. Move it to a folder you keep tools in (for example `C:\Tools\croppy\`).
-3. Add that folder to your `Path` environment variable.
 
 ### Option 2: Build from source
 
