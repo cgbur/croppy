@@ -30,7 +30,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
-use image::{GrayImage, ImageBuffer, Luma, RgbImage};
+use image::{ImageBuffer, Luma, RgbImage};
 use rsraw::{BIT_DEPTH_8, ImageFormat, RawImage};
 use rsraw_sys as sys;
 
@@ -212,12 +212,6 @@ pub fn decode_raw_bytes_to_rgb(bytes: &[u8], source: &Path) -> Result<RgbImage> 
         8,
         &data,
     )
-}
-
-pub fn rgb_to_gray(img: &RgbImage) -> GrayImage {
-    image::DynamicImage::ImageRgb8(img.clone())
-        .grayscale()
-        .to_luma8()
 }
 
 fn decode_raw_file_to_rgb(path: &Path) -> Result<RgbImage> {

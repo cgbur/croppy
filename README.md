@@ -29,7 +29,37 @@ Croppy does **not** modify, delete, or rewrite your RAW files.
 
 ## Install
 
-### Build from source
+### Option 1: Download a prebuilt release (recommended)
+
+1. Open the latest release page: `https://github.com/cgbur/croppy/releases/latest`
+2. Download the asset for your platform:
+- Linux x86_64: `croppy-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz`
+- macOS (Apple Silicon): `croppy-vX.Y.Z-aarch64-apple-darwin.tar.gz`
+- Windows x86_64: `croppy-vX.Y.Z-x86_64-pc-windows-msvc.zip`
+3. Extract the archive.
+4. Move the binary into a directory on your `PATH`.
+
+Linux / macOS example:
+
+```bash
+mkdir -p "$HOME/.local/bin"
+cp croppy "$HOME/.local/bin/croppy"
+chmod +x "$HOME/.local/bin/croppy"
+```
+
+If needed, add to shell profile (`~/.bashrc` or `~/.zshrc`):
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Windows example:
+
+1. Extract `croppy.exe`.
+2. Move it to a folder you keep tools in (for example `C:\Tools\croppy\`).
+3. Add that folder to your `Path` environment variable.
+
+### Option 2: Build from source
 
 ```bash
 cargo build --release
@@ -41,15 +71,19 @@ Binary path:
 target/release/croppy
 ```
 
+### TODO: one-line installer
+
+A curl-only `install.sh` that auto-detects OS/arch and installs the latest release is planned, but not shipped yet.
+
 ## Run
 
-Basic run:
+Basic run (after install):
 
 ```bash
-cargo run --release -- /path/to/raw/folder
+croppy /path/to/raw/folder
 ```
 
-Or with built binary:
+If you built from source but did not install into `PATH`:
 
 ```bash
 ./target/release/croppy /path/to/raw/folder
@@ -121,7 +155,7 @@ That default vertical trim is a small inward bias that often helps remove a litt
 - RAW decode with `libraw` bindings (`rsraw`/`rsraw-sys`).
 - Preprocess to improve edge contrast (grayscale, invert, levels, 180-degree normalization).
 - Detect frame bounds from image profiles/edge scans.
-- Optionally refine rotation from fitted edge lines.
+- Attempts one deterministic rotation-refine pass from fitted edge lines, and only applies it when the estimate is valid/plausible.
 - Write Lightroom crop metadata (`CropLeft`, `CropTop`, `CropRight`, `CropBottom`, `CropAngle`) to XMP sidecars.
 
 No machine learning, no OpenCV, minimal dependencies.
