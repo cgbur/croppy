@@ -14,7 +14,7 @@ use crate::detect_refine::{
     run_detection_with_rotation_refine,
 };
 use crate::discover::is_supported_raw;
-use crate::preprocess::{PreprocessConfig, prepare_image, resize_rgb_max_edge_owned};
+use crate::preprocess::{PreprocessConfig, prepare_image, resize_gray_max_edge};
 use crate::raw::decode_raw_to_rgb_with_hint;
 
 pub const PREVIEW_SUBDIR: &str = "previews";
@@ -94,11 +94,11 @@ pub fn process_raw_file(
 
     let decoded = decode_raw_to_rgb_with_hint(raw, opts.max_edge)?;
     let warning = decoded.warning;
-    let rgb = resize_rgb_max_edge_owned(decoded.image, opts.max_edge);
+    let gray = image::imageops::grayscale(&decoded.image);
+    let gray = resize_gray_max_edge(gray, opts.max_edge);
     if cancel.load(Ordering::Relaxed) {
         return Err(anyhow!(CANCELLED_MARKER));
     }
-    let gray = image::imageops::grayscale(&rgb);
     let preprocess_cfg = PreprocessConfig {
         invert: true,
         flip_180: true,
