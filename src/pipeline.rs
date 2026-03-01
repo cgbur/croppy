@@ -8,7 +8,7 @@ use anyhow::{Result, anyhow};
 use image::{GrayImage, Luma};
 use imageproc::geometric_transformations::{Interpolation, rotate_about_center};
 
-use crate::detect::BoundsNorm;
+use crate::detect::{BoundsNorm, clamp_trim};
 use crate::detect_refine::{
     DetectRefineRun, RotationRefineConfig, draw_norm_rect, draw_refined_inner_backproject,
     run_detection_with_rotation_refine,
@@ -19,14 +19,10 @@ use crate::raw::decode_raw_to_rgb_with_hint;
 
 pub const PREVIEW_SUBDIR: &str = "previews";
 pub const CANCELLED_MARKER: &str = "__croppy_cancelled__";
-pub const FINAL_CROP_SCALE_MIN_PCT: f32 = -20.0;
-pub const FINAL_CROP_SCALE_MAX_PCT: f32 = 20.0;
-pub const FINAL_CROP_SCALE_FINE_STEP_PCT: f32 = 0.25;
-pub const XMP_HORIZONTAL_TRIM_DEFAULT: f32 = 0.0;
-pub const XMP_VERTICAL_TRIM_DEFAULT: f32 = 0.005;
-pub const XMP_TRIM_MIN: f32 = -0.05;
-pub const XMP_TRIM_MAX: f32 = 0.05;
-pub const XMP_TRIM_STEP: f32 = 0.001;
+pub const SCALE_FINE_STEP_PCT: f32 = 0.25;
+pub const HORIZONTAL_TRIM_DEFAULT: f32 = 0.0;
+pub const VERTICAL_TRIM_DEFAULT: f32 = 0.005;
+pub const TRIM_STEP: f32 = 0.001;
 const FRAME_PAD_FRAC: f32 = 0.06;
 const FRAME_PAD_MIN_PX: u32 = 20;
 
@@ -87,26 +83,6 @@ pub fn preview_dir(out_dir: &Path) -> PathBuf {
     out_dir.join(PREVIEW_SUBDIR)
 }
 
-pub fn adjust_final_crop_scale_pct(current: f32, delta: f32) -> f32 {
-    clamp_final_crop_scale_pct(current + delta)
-}
-
-pub fn clamp_final_crop_scale_pct(value: f32) -> f32 {
-    value.clamp(FINAL_CROP_SCALE_MIN_PCT, FINAL_CROP_SCALE_MAX_PCT)
-}
-
-pub fn adjust_xmp_trim(current: f32, delta: f32) -> f32 {
-    clamp_xmp_trim(current + delta)
-}
-
-pub fn clamp_xmp_trim(value: f32) -> f32 {
-    value.clamp(XMP_TRIM_MIN, XMP_TRIM_MAX)
-}
-
-pub fn is_cancelled_message(message: &str) -> bool {
-    message == CANCELLED_MARKER
-}
-
 pub fn process_raw_file(
     raw: &Path,
     opts: &PipelineOptions,
@@ -150,38 +126,15 @@ pub fn process_raw_file(
         }
         let preview_path = preview_path_for(raw, &opts.out_dir);
         guard_write_target(raw, &preview_path, "preview")?;
-        match opts.preview_mode {
-            PreviewMode::DebugOverlay => {
-                write_overlay_preview(
-                    &prepared,
-                    &refine,
-                    opts.final_crop_scale_pct,
-                    opts.horizontal_trim,
-                    opts.vertical_trim,
-                    &preview_path,
-                )?;
-            }
-            PreviewMode::FinalCrop => {
-                write_final_crop_preview(
-                    &prepared,
-                    &refine,
-                    opts.final_crop_scale_pct,
-                    opts.horizontal_trim,
-                    opts.vertical_trim,
-                    &preview_path,
-                )?;
-            }
-            PreviewMode::FinalCropFramed => {
-                write_framed_final_crop_preview(
-                    &prepared,
-                    &refine,
-                    opts.final_crop_scale_pct,
-                    opts.horizontal_trim,
-                    opts.vertical_trim,
-                    &preview_path,
-                )?;
-            }
-        }
+        write_preview(
+            &prepared,
+            &refine,
+            opts.preview_mode,
+            opts.final_crop_scale_pct,
+            opts.horizontal_trim,
+            opts.vertical_trim,
+            &preview_path,
+        )?;
         out.preview = Some(preview_path);
     }
 
@@ -223,130 +176,98 @@ fn preview_path_for(raw: &Path, out_dir: &Path) -> PathBuf {
     preview_dir(out_dir).join(base)
 }
 
-fn write_overlay_preview(
-    prepared: &GrayImage,
+fn adjusted_bounds(
     refine: &DetectRefineRun,
-    final_crop_scale_pct: f32,
-    horizontal_trim: f32,
-    vertical_trim: f32,
-    preview_path: &Path,
-) -> Result<()> {
-    let mut overlay = gray_to_rgb(prepared);
-    draw_norm_rect(
-        &mut overlay,
-        refine.detection_initial.inner,
-        image::Rgb([255, 255, 0]),
-    );
-    if let (Some(refined_det), Some(applied_deg)) =
+    scale_pct: f32,
+    h_trim: f32,
+    v_trim: f32,
+) -> (BoundsNorm, Option<f32>) {
+    let (inner, theta) = if let (Some(refined_det), Some(applied_deg)) =
         (refine.detection_refined, refine.rotation_applied_deg)
     {
-        draw_refined_inner_backproject(
-            &mut overlay,
-            refined_det.inner,
-            applied_deg.to_radians(),
-            image::Rgb([80, 255, 255]),
-        );
-    }
-    let show_adjusted = final_crop_scale_pct.abs() > f32::EPSILON
-        || horizontal_trim.abs() > f32::EPSILON
-        || vertical_trim.abs() > f32::EPSILON;
-    if show_adjusted {
-        let (final_inner, theta_opt) = final_preview_inner_bounds(
-            refine,
-            final_crop_scale_pct,
-            horizontal_trim,
-            vertical_trim,
-        );
-        if let Some(theta) = theta_opt {
-            draw_refined_inner_backproject(
+        (refined_det.inner, Some(applied_deg.to_radians()))
+    } else {
+        (refine.detection.inner, None)
+    };
+    let adjusted = inner
+        .normalize()
+        .scale_about_center(scale_pct)
+        .apply_trim(clamp_trim(h_trim), clamp_trim(v_trim));
+    (adjusted, theta)
+}
+
+fn write_preview(
+    prepared: &GrayImage,
+    refine: &DetectRefineRun,
+    mode: PreviewMode,
+    scale_pct: f32,
+    h_trim: f32,
+    v_trim: f32,
+    path: &Path,
+) -> Result<()> {
+    let save = |img: &GrayImage| -> Result<()> {
+        gray_to_rgb(img).save_with_format(path, image::ImageFormat::Jpeg)?;
+        Ok(())
+    };
+
+    match mode {
+        PreviewMode::DebugOverlay => {
+            let mut overlay = gray_to_rgb(prepared);
+            draw_norm_rect(
                 &mut overlay,
-                final_inner,
-                theta,
-                image::Rgb([120, 255, 120]),
+                refine.detection_initial.inner,
+                image::Rgb([255, 255, 0]),
             );
-        } else {
-            draw_norm_rect(&mut overlay, final_inner, image::Rgb([120, 255, 120]));
+            if let (Some(refined_det), Some(applied_deg)) =
+                (refine.detection_refined, refine.rotation_applied_deg)
+            {
+                draw_refined_inner_backproject(
+                    &mut overlay,
+                    refined_det.inner,
+                    applied_deg.to_radians(),
+                    image::Rgb([80, 255, 255]),
+                );
+            }
+            let has_adjustments = scale_pct.abs() > f32::EPSILON
+                || h_trim.abs() > f32::EPSILON
+                || v_trim.abs() > f32::EPSILON;
+            if has_adjustments {
+                let (final_inner, theta_opt) =
+                    adjusted_bounds(refine, scale_pct, h_trim, v_trim);
+                if let Some(theta) = theta_opt {
+                    draw_refined_inner_backproject(
+                        &mut overlay,
+                        final_inner,
+                        theta,
+                        image::Rgb([120, 255, 120]),
+                    );
+                } else {
+                    draw_norm_rect(&mut overlay, final_inner, image::Rgb([120, 255, 120]));
+                }
+            }
+            overlay.save_with_format(path, image::ImageFormat::Jpeg)?;
+        }
+        PreviewMode::FinalCrop => {
+            let crop = render_final_crop(prepared, refine, scale_pct, h_trim, v_trim);
+            save(&crop)?;
+        }
+        PreviewMode::FinalCropFramed => {
+            let crop = render_final_crop(prepared, refine, scale_pct, h_trim, v_trim);
+            let framed = render_crop_with_white_frame(&crop);
+            save(&framed)?;
         }
     }
-    overlay.save_with_format(preview_path, image::ImageFormat::Jpeg)?;
     Ok(())
 }
 
-fn write_final_crop_preview(
+fn render_final_crop(
     prepared: &GrayImage,
     refine: &DetectRefineRun,
-    final_crop_scale_pct: f32,
-    horizontal_trim: f32,
-    vertical_trim: f32,
-    preview_path: &Path,
-) -> Result<()> {
-    let crop = render_final_crop_image(
-        prepared,
-        refine,
-        final_crop_scale_pct,
-        horizontal_trim,
-        vertical_trim,
-    );
-    gray_to_rgb(&crop).save_with_format(preview_path, image::ImageFormat::Jpeg)?;
-    Ok(())
-}
-
-fn write_framed_final_crop_preview(
-    prepared: &GrayImage,
-    refine: &DetectRefineRun,
-    final_crop_scale_pct: f32,
-    horizontal_trim: f32,
-    vertical_trim: f32,
-    preview_path: &Path,
-) -> Result<()> {
-    let crop = render_final_crop_image(
-        prepared,
-        refine,
-        final_crop_scale_pct,
-        horizontal_trim,
-        vertical_trim,
-    );
-    let framed = render_crop_with_white_frame(&crop);
-    gray_to_rgb(&framed).save_with_format(preview_path, image::ImageFormat::Jpeg)?;
-    Ok(())
-}
-
-fn final_preview_inner_bounds(
-    refine: &DetectRefineRun,
-    final_crop_scale_pct: f32,
-    horizontal_trim: f32,
-    vertical_trim: f32,
-) -> (BoundsNorm, Option<f32>) {
-    if let (Some(refined_det), Some(applied_deg)) =
-        (refine.detection_refined, refine.rotation_applied_deg)
-    {
-        let adjusted = adjust_final_inner_bounds(
-            refined_det.inner,
-            final_crop_scale_pct,
-            horizontal_trim,
-            vertical_trim,
-        );
-        (adjusted, Some(applied_deg.to_radians()))
-    } else {
-        let adjusted = adjust_final_inner_bounds(
-            refine.detection.inner,
-            final_crop_scale_pct,
-            horizontal_trim,
-            vertical_trim,
-        );
-        (adjusted, None)
-    }
-}
-
-fn render_final_crop_image(
-    prepared: &GrayImage,
-    refine: &DetectRefineRun,
-    final_crop_scale_pct: f32,
-    horizontal_trim: f32,
-    vertical_trim: f32,
+    scale_pct: f32,
+    h_trim: f32,
+    v_trim: f32,
 ) -> GrayImage {
-    let (final_inner, theta_opt) =
-        final_preview_inner_bounds(refine, final_crop_scale_pct, horizontal_trim, vertical_trim);
+    let (final_inner, theta_opt) = adjusted_bounds(refine, scale_pct, h_trim, v_trim);
     if let Some(theta) = theta_opt {
         let rotated = rotate_about_center(prepared, theta, Interpolation::Bilinear, Luma([0u8]));
         extract_norm_crop(&rotated, final_inner)
@@ -400,18 +321,12 @@ fn xmp_crop_from_detection(
 ) -> XmpCrop {
     let mut bounds = inner_detected;
     if preprocess_flip_180 {
-        // Detection runs in a frame rotated 180 degrees; mirror bounds back so
-        // sidecar geometry matches RAW orientation. CropAngle sign conversion is
-        // handled separately below.
-        bounds = rotate_bounds_180(bounds);
+        bounds = bounds.rotate_180();
     }
-    bounds = normalize_bounds(bounds);
-    bounds = scale_bounds_about_center(bounds, final_crop_scale_pct);
-    bounds = apply_axis_trim(
-        bounds,
-        clamp_xmp_trim(horizontal_trim),
-        clamp_xmp_trim(vertical_trim),
-    );
+    bounds = bounds
+        .normalize()
+        .scale_about_center(final_crop_scale_pct)
+        .apply_trim(clamp_trim(horizontal_trim), clamp_trim(vertical_trim));
     XmpCrop {
         left: bounds.left,
         top: bounds.top,
@@ -421,83 +336,6 @@ fn xmp_crop_from_detection(
         // Lightroom's CropAngle uses the opposite sign convention.
         angle_deg: -rotation_applied_deg.unwrap_or(0.0),
     }
-}
-
-fn rotate_bounds_180(b: BoundsNorm) -> BoundsNorm {
-    BoundsNorm {
-        left: 1.0 - b.right,
-        top: 1.0 - b.bottom,
-        right: 1.0 - b.left,
-        bottom: 1.0 - b.top,
-    }
-}
-
-fn normalize_bounds(b: BoundsNorm) -> BoundsNorm {
-    let mut left = b.left.clamp(0.0, 1.0);
-    let mut right = b.right.clamp(0.0, 1.0);
-    let mut top = b.top.clamp(0.0, 1.0);
-    let mut bottom = b.bottom.clamp(0.0, 1.0);
-    if left > right {
-        std::mem::swap(&mut left, &mut right);
-    }
-    if top > bottom {
-        std::mem::swap(&mut top, &mut bottom);
-    }
-    BoundsNorm {
-        left,
-        top,
-        right,
-        bottom,
-    }
-}
-
-fn scale_bounds_about_center(bounds: BoundsNorm, scale_pct: f32) -> BoundsNorm {
-    let scale_pct = clamp_final_crop_scale_pct(scale_pct);
-    let scale = (1.0 + (scale_pct / 100.0)).max(0.01);
-
-    let cx = (bounds.left + bounds.right) * 0.5;
-    let cy = (bounds.top + bounds.bottom) * 0.5;
-    let half_w = (bounds.right - bounds.left).abs() * 0.5 * scale;
-    let half_h = (bounds.bottom - bounds.top).abs() * 0.5 * scale;
-
-    normalize_bounds(BoundsNorm {
-        left: cx - half_w,
-        top: cy - half_h,
-        right: cx + half_w,
-        bottom: cy + half_h,
-    })
-}
-
-fn adjust_final_inner_bounds(
-    bounds: BoundsNorm,
-    final_crop_scale_pct: f32,
-    horizontal_trim: f32,
-    vertical_trim: f32,
-) -> BoundsNorm {
-    let scaled = scale_bounds_about_center(normalize_bounds(bounds), final_crop_scale_pct);
-    apply_axis_trim(
-        scaled,
-        clamp_xmp_trim(horizontal_trim),
-        clamp_xmp_trim(vertical_trim),
-    )
-}
-
-fn apply_axis_trim(bounds: BoundsNorm, horizontal_trim: f32, vertical_trim: f32) -> BoundsNorm {
-    let b = normalize_bounds(bounds);
-    let width = (b.right - b.left).abs();
-    let height = (b.bottom - b.top).abs();
-    // Prevent positive trim from collapsing an axis past zero width/height.
-    let max_trim_x = (width * 0.5 - 1e-6).max(0.0);
-    let max_trim_y = (height * 0.5 - 1e-6).max(0.0);
-    let trim_x = horizontal_trim.min(max_trim_x);
-    let trim_y = vertical_trim.min(max_trim_y);
-
-    normalize_bounds(BoundsNorm {
-        left: b.left + trim_x,
-        top: b.top + trim_y,
-        right: b.right - trim_x,
-        bottom: b.bottom - trim_y,
-    })
 }
 
 fn guard_write_target(raw: &Path, target: &Path, output_kind: &str) -> Result<()> {
