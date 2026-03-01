@@ -127,10 +127,14 @@ fn consensus_fit_line_t_of_u(points: &[(f32, f32)]) -> Option<ConsensusLineFit> 
         return None;
     }
 
-    let (min_t, max_t) = points
+    // Split into SoA for SIMD-friendly access patterns.
+    let ts: Vec<f32> = points.iter().map(|p| p.0).collect();
+    let us: Vec<f32> = points.iter().map(|p| p.1).collect();
+
+    let (min_t, max_t) = ts
         .iter()
-        .fold((f32::INFINITY, f32::NEG_INFINITY), |acc, p| {
-            (acc.0.min(p.0), acc.1.max(p.0))
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |acc, &t| {
+            (acc.0.min(t), acc.1.max(t))
         });
     let span_t = max_t - min_t;
     if span_t <= 1e-3 {
@@ -138,30 +142,22 @@ fn consensus_fit_line_t_of_u(points: &[(f32, f32)]) -> Option<ConsensusLineFit> 
     }
     let inlier_thresh = (span_t * 0.0035).clamp(0.8, 2.5);
 
-    let mut best_count = 0usize;
+    let mut best_count = 0u32;
     let mut best_err = f32::INFINITY;
     let mut best_mb: Option<(f32, f32)> = None;
 
     for i in 0..points.len() {
         for j in (i + 1)..points.len() {
-            let (t1, u1) = points[i];
-            let (t2, u2) = points[j];
+            let t1 = ts[i];
+            let t2 = ts[j];
             let dt = t2 - t1;
             if dt.abs() <= 1e-3 {
                 continue;
             }
-            let m = (u2 - u1) / dt;
-            let b = u1 - m * t1;
+            let m = (us[j] - us[i]) / dt;
+            let b = us[i] - m * t1;
 
-            let mut count = 0usize;
-            let mut err = 0.0f32;
-            for (t, u) in points {
-                let r = (*u - (m * *t + b)).abs();
-                if r <= inlier_thresh {
-                    count += 1;
-                    err += r;
-                }
-            }
+            let (count, err) = count_inliers(&ts, &us, m, b, inlier_thresh);
 
             if count > best_count || (count == best_count && err < best_err) {
                 best_count = count;
@@ -181,6 +177,52 @@ fn consensus_fit_line_t_of_u(points: &[(f32, f32)]) -> Option<ConsensusLineFit> 
     let score = inlier_ratio * span_score * residual_score;
 
     best_mb.map(|(m, b)| ConsensusLineFit { m, b, score })
+}
+
+/// Count inliers and sum their residuals using a layout that the compiler can
+/// auto-vectorize. The key is processing contiguous f32 slices with
+/// `chunks_exact` so LLVM can emit packed SIMD ops for the residual computation.
+#[inline(always)]
+fn count_inliers(ts: &[f32], us: &[f32], m: f32, b: f32, thresh: f32) -> (u32, f32) {
+    debug_assert_eq!(ts.len(), us.len());
+    let n = ts.len();
+    let mut count = 0u32;
+    let mut err = 0.0f32;
+
+    // Process 8 elements at a time. The compiler will vectorize
+    // the residual computation across the chunk.
+    let chunks_t = ts[..n].chunks_exact(8);
+    let remainder_start = chunks_t.remainder().len();
+    let tail_start = n - remainder_start;
+
+    for (chunk_t, chunk_u) in chunks_t.zip(us[..n].chunks_exact(8)) {
+        // Compute residuals for the chunk — this inner block is pure
+        // arithmetic on contiguous slices, which LLVM vectorizes well.
+        let mut residuals = [0.0f32; 8];
+        for k in 0..8 {
+            let predicted = m * chunk_t[k] + b;
+            let r = (chunk_u[k] - predicted).abs();
+            residuals[k] = r;
+        }
+
+        for k in 0..8 {
+            if residuals[k] <= thresh {
+                count += 1;
+                err += residuals[k];
+            }
+        }
+    }
+
+    // Handle remainder.
+    for k in tail_start..n {
+        let r = (us[k] - (m * ts[k] + b)).abs();
+        if r <= thresh {
+            count += 1;
+            err += r;
+        }
+    }
+
+    (count, err)
 }
 
 #[cfg(test)]
