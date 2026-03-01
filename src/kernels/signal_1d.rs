@@ -9,17 +9,19 @@ use image::GrayImage;
 /// one or more y-ranges.
 pub fn profile_vertical_ranges(gray: &GrayImage, y_ranges: &[(u32, u32)]) -> Vec<f32> {
     let (w, _) = gray.dimensions();
+    let raw = gray.as_raw();
+    let stride = w as usize;
     (0..w)
         .map(|x| {
-            let mut sum = 0.0f32;
+            let mut sum = 0u32;
             let mut n = 0u32;
-            for (y0, y1) in y_ranges {
-                for y in *y0..=*y1 {
-                    sum += gray.get_pixel(x, y)[0] as f32;
+            for &(y0, y1) in y_ranges {
+                for y in y0..=y1 {
+                    sum += raw[y as usize * stride + x as usize] as u32;
                     n += 1;
                 }
             }
-            if n == 0 { 0.0 } else { sum / n as f32 }
+            if n == 0 { 0.0 } else { sum as f32 / n as f32 }
         })
         .collect()
 }
@@ -27,18 +29,33 @@ pub fn profile_vertical_ranges(gray: &GrayImage, y_ranges: &[(u32, u32)]) -> Vec
 /// Builds a horizontal brightness profile (indexed by y) by averaging pixels in
 /// one or more x-ranges.
 pub fn profile_horizontal_ranges(gray: &GrayImage, x_ranges: &[(u32, u32)]) -> Vec<f32> {
-    let (_, h) = gray.dimensions();
+    let (w, h) = gray.dimensions();
+    let raw = gray.as_raw();
+    let stride = w as usize;
     (0..h)
         .map(|y| {
-            let mut sum = 0.0f32;
+            let row_start = y as usize * stride;
+            let mut sum = 0u32;
             let mut n = 0u32;
-            for (x0, x1) in x_ranges {
-                for x in *x0..=*x1 {
-                    sum += gray.get_pixel(x, y)[0] as f32;
+            for &(x0, x1) in x_ranges {
+                let slice = &raw[row_start + x0 as usize..=row_start + x1 as usize];
+                // Process contiguous row bytes in chunks for auto-vectorization.
+                let chunks = slice.chunks_exact(16);
+                let remainder = chunks.remainder();
+                for chunk in chunks {
+                    let mut s = 0u32;
+                    for &v in chunk {
+                        s += v as u32;
+                    }
+                    sum += s;
+                    n += 16;
+                }
+                for &v in remainder {
+                    sum += v as u32;
                     n += 1;
                 }
             }
-            if n == 0 { 0.0 } else { sum / n as f32 }
+            if n == 0 { 0.0 } else { sum as f32 / n as f32 }
         })
         .collect()
 }
@@ -49,17 +66,29 @@ pub fn smooth_boxcar(v: &[f32], radius: usize) -> Vec<f32> {
         return v.to_vec();
     }
 
-    let mut out = vec![0.0f32; v.len()];
-    for (i, outv) in out.iter_mut().enumerate() {
-        let a = i.saturating_sub(radius);
-        let b = (i + radius).min(v.len() - 1);
-        let mut sum = 0.0f32;
-        let mut n = 0usize;
-        for val in v.iter().take(b + 1).skip(a) {
-            sum += *val;
-            n += 1;
+    // Use a sliding window sum instead of re-summing the window for each output.
+    let n = v.len();
+    let mut out = vec![0.0f32; n];
+
+    // Seed: sum the initial window for index 0.
+    let b0 = radius.min(n - 1);
+    let mut wsum: f32 = v[..=b0].iter().sum();
+    let mut wcount = (b0 + 1) as f32;
+    out[0] = wsum / wcount;
+
+    for i in 1..n {
+        // Add the new element entering the window on the right.
+        let new_right = i + radius;
+        if new_right < n {
+            wsum += v[new_right];
+            wcount += 1.0;
         }
-        *outv = if n == 0 { 0.0 } else { sum / n as f32 };
+        // Remove the element leaving the window on the left.
+        if i > radius {
+            wsum -= v[i - radius - 1];
+            wcount -= 1.0;
+        }
+        out[i] = wsum / wcount;
     }
     out
 }
@@ -74,8 +103,9 @@ pub fn signed_derivative(v: &[f32]) -> Vec<f32> {
     }
 
     let mut out = vec![0.0f32; v.len()];
-    for i in 1..v.len() {
-        out[i] = v[i] - v[i - 1];
+    // Use windows for SIMD-friendly contiguous access.
+    for (i, w) in v.windows(2).enumerate() {
+        out[i + 1] = w[1] - w[0];
     }
     out
 }
