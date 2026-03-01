@@ -1,4 +1,4 @@
-use image::{GrayImage, Rgb, RgbImage};
+use image::GrayImage;
 use serde::Serialize;
 
 use crate::kernels::edge_scan::{self, AxisDetectConfig, EdgePolarity};
@@ -39,19 +39,88 @@ pub struct BoundsNorm {
     pub bottom: f32,
 }
 
+impl BoundsNorm {
+    pub fn rotate_180(self) -> Self {
+        Self {
+            left: 1.0 - self.right,
+            top: 1.0 - self.bottom,
+            right: 1.0 - self.left,
+            bottom: 1.0 - self.top,
+        }
+    }
+
+    pub fn normalize(self) -> Self {
+        let mut left = self.left.clamp(0.0, 1.0);
+        let mut right = self.right.clamp(0.0, 1.0);
+        let mut top = self.top.clamp(0.0, 1.0);
+        let mut bottom = self.bottom.clamp(0.0, 1.0);
+        if left > right {
+            std::mem::swap(&mut left, &mut right);
+        }
+        if top > bottom {
+            std::mem::swap(&mut top, &mut bottom);
+        }
+        Self {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    pub fn scale_about_center(self, scale_pct: f32) -> Self {
+        let scale_pct = scale_pct.clamp(SCALE_MIN_PCT, SCALE_MAX_PCT);
+        let scale = (1.0 + (scale_pct / 100.0)).max(0.01);
+        let cx = (self.left + self.right) * 0.5;
+        let cy = (self.top + self.bottom) * 0.5;
+        let half_w = (self.right - self.left).abs() * 0.5 * scale;
+        let half_h = (self.bottom - self.top).abs() * 0.5 * scale;
+        Self {
+            left: cx - half_w,
+            top: cy - half_h,
+            right: cx + half_w,
+            bottom: cy + half_h,
+        }
+        .normalize()
+    }
+
+    pub fn apply_trim(self, horizontal: f32, vertical: f32) -> Self {
+        let b = self.normalize();
+        let width = (b.right - b.left).abs();
+        let height = (b.bottom - b.top).abs();
+        // Prevent positive trim from collapsing an axis past zero width/height.
+        let max_trim_x = (width * 0.5 - 1e-6).max(0.0);
+        let max_trim_y = (height * 0.5 - 1e-6).max(0.0);
+        let trim_x = horizontal.min(max_trim_x);
+        let trim_y = vertical.min(max_trim_y);
+        Self {
+            left: b.left + trim_x,
+            top: b.top + trim_y,
+            right: b.right - trim_x,
+            bottom: b.bottom - trim_y,
+        }
+        .normalize()
+    }
+}
+
+// Crop scale limits exposed for the TUI and pipeline.
+pub const SCALE_MIN_PCT: f32 = -20.0;
+pub const SCALE_MAX_PCT: f32 = 20.0;
+pub const TRIM_MIN: f32 = -0.05;
+pub const TRIM_MAX: f32 = 0.05;
+
+pub fn clamp_scale_pct(value: f32) -> f32 {
+    value.clamp(SCALE_MIN_PCT, SCALE_MAX_PCT)
+}
+
+pub fn clamp_trim(value: f32) -> f32 {
+    value.clamp(TRIM_MIN, TRIM_MAX)
+}
+
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct Detection {
     pub inner: BoundsNorm,
     pub confidence: f32,
-}
-
-#[derive(Debug, Clone, Copy, Serialize)]
-pub struct RotationEstimate {
-    pub angle_deg: f32,
-    pub top_angle_deg: f32,
-    pub bottom_angle_deg: f32,
-    pub points_top: usize,
-    pub points_bottom: usize,
 }
 
 /// Detects film bounds from a preprocessed grayscale image.
@@ -126,160 +195,3 @@ fn sample_band_bounds(w: u32, h: u32) -> (u32, u32, u32, u32) {
     (y0, y1, x0, x1)
 }
 
-pub fn draw_detection_overlay(img: &mut RgbImage, det: Detection) {
-    let (w, h) = img.dimensions();
-    draw_norm_rect(
-        img,
-        det.inner,
-        Rgb([255, 255, 0]), // yellow = inner
-        w,
-        h,
-    );
-}
-
-pub fn estimate_rotation_from_inner(gray: &GrayImage, det: Detection) -> Option<RotationEstimate> {
-    let (w, h) = gray.dimensions();
-    if w < MIN_DETECT_DIM || h < MIN_DETECT_DIM {
-        return None;
-    }
-    let x1 = ((det.inner.left * w as f32).round() as i32).clamp(0, (w - 1) as i32) as u32;
-    let x2 = ((det.inner.right * w as f32).round() as i32).clamp(0, (w - 1) as i32) as u32;
-    let y1 = ((det.inner.top * h as f32).round() as i32).clamp(0, (h - 1) as i32) as u32;
-    let y2 = ((det.inner.bottom * h as f32).round() as i32).clamp(0, (h - 1) as i32) as u32;
-    if x2 <= x1 + 8 || y2 <= y1 + 8 {
-        return None;
-    }
-
-    let inner_w = x2 - x1;
-    let x_margin = ((inner_w as f32) * 0.08).round() as u32;
-    let xa = x1.saturating_add(x_margin).min(x2);
-    let xb = x2.saturating_sub(x_margin).max(xa + 1);
-    let search_half = ((h as f32) * 0.08).round().clamp(6.0, 80.0) as i32;
-    let stride = ((inner_w as f32) / 180.0).round().clamp(1.0, 4.0) as u32;
-
-    let top_pts = sample_edge_points(gray, xa, xb, y1 as i32, search_half, stride);
-    let bot_pts = sample_edge_points(gray, xa, xb, y2 as i32, search_half, stride);
-    if top_pts.len() < 8 || bot_pts.len() < 8 {
-        return None;
-    }
-
-    let (m_top, _b_top) = fit_line(&top_pts)?;
-    let (m_bot, _b_bot) = fit_line(&bot_pts)?;
-    let top_angle = m_top.atan().to_degrees();
-    let bot_angle = m_bot.atan().to_degrees();
-    Some(RotationEstimate {
-        angle_deg: (top_angle + bot_angle) * 0.5,
-        top_angle_deg: top_angle,
-        bottom_angle_deg: bot_angle,
-        points_top: top_pts.len(),
-        points_bottom: bot_pts.len(),
-    })
-}
-
-fn draw_norm_rect(img: &mut RgbImage, b: BoundsNorm, color: Rgb<u8>, w: u32, h: u32) {
-    let x1 = (b.left * w as f32).round() as i32;
-    let y1 = (b.top * h as f32).round() as i32;
-    let x2 = (b.right * w as f32).round() as i32;
-    let y2 = (b.bottom * h as f32).round() as i32;
-
-    draw_rect(
-        img,
-        x1.max(0) as u32,
-        y1.max(0) as u32,
-        x2.max(1) as u32,
-        y2.max(1) as u32,
-        color,
-    );
-}
-
-fn draw_rect(img: &mut RgbImage, x1: u32, y1: u32, x2: u32, y2: u32, color: Rgb<u8>) {
-    let (w, h) = img.dimensions();
-    if w == 0 || h == 0 {
-        return;
-    }
-    let xa = x1.min(w - 1);
-    let xb = x2.min(w - 1);
-    let ya = y1.min(h - 1);
-    let yb = y2.min(h - 1);
-    if xa >= xb || ya >= yb {
-        return;
-    }
-
-    for x in xa..=xb {
-        *img.get_pixel_mut(x, ya) = color;
-        *img.get_pixel_mut(x, yb) = color;
-    }
-    for y in ya..=yb {
-        *img.get_pixel_mut(xa, y) = color;
-        *img.get_pixel_mut(xb, y) = color;
-    }
-}
-
-fn sample_edge_points(
-    gray: &GrayImage,
-    x_start: u32,
-    x_end: u32,
-    y_hint: i32,
-    search_half: i32,
-    stride: u32,
-) -> Vec<(f32, f32)> {
-    let mut points = Vec::new();
-    let h = gray.height() as i32;
-    let y0 = (y_hint - search_half).clamp(1, h - 2);
-    let y1 = (y_hint + search_half).clamp(1, h - 2);
-    if y1 <= y0 {
-        return points;
-    }
-
-    let mut x = x_start;
-    while x <= x_end {
-        let mut best_y = y_hint.clamp(y0, y1);
-        let mut best_score = f32::MIN;
-        for y in y0..=y1 {
-            let a = gray.get_pixel(x, y as u32 - 1)[0] as f32;
-            let b = gray.get_pixel(x, y as u32 + 1)[0] as f32;
-            let grad = (b - a).abs();
-            let dist = (y - y_hint).abs() as f32;
-            let score = grad - dist * 0.25;
-            if score > best_score {
-                best_score = score;
-                best_y = y;
-            }
-        }
-        if best_score > 4.0 {
-            points.push((x as f32, best_y as f32));
-        }
-        if x_end - x < stride {
-            break;
-        }
-        x += stride.max(1);
-    }
-    points
-}
-
-fn fit_line(points: &[(f32, f32)]) -> Option<(f32, f32)> {
-    if points.len() < 2 {
-        return None;
-    }
-    let n = points.len() as f32;
-    let (sum_x, sum_y) = points
-        .iter()
-        .fold((0.0f32, 0.0f32), |(sx, sy), (x, y)| (sx + *x, sy + *y));
-    let mx = sum_x / n;
-    let my = sum_y / n;
-
-    let mut num = 0.0f32;
-    let mut den = 0.0f32;
-    for (x, y) in points {
-        let dx = *x - mx;
-        let dy = *y - my;
-        num += dx * dy;
-        den += dx * dx;
-    }
-    if den <= 1e-6 {
-        return None;
-    }
-    let m = num / den;
-    let b = my - m * mx;
-    Some((m, b))
-}

@@ -8,12 +8,11 @@ use std::{fs, thread};
 
 use anyhow::{Result, anyhow};
 use clap::Parser;
+use croppy::detect::{clamp_scale_pct, clamp_trim};
 use croppy::discover::{is_supported_raw, list_raw_files};
 use croppy::pipeline::{
-    CANCELLED_MARKER, FINAL_CROP_SCALE_FINE_STEP_PCT, PipelineOptions, PreviewMode,
-    XMP_HORIZONTAL_TRIM_DEFAULT, XMP_TRIM_STEP, XMP_VERTICAL_TRIM_DEFAULT,
-    adjust_final_crop_scale_pct, adjust_xmp_trim, clamp_xmp_trim, is_cancelled_message,
-    preview_dir, process_raw_file as process_pipeline_raw,
+    CANCELLED_MARKER, HORIZONTAL_TRIM_DEFAULT, PipelineOptions, PreviewMode, SCALE_FINE_STEP_PCT,
+    TRIM_STEP, VERTICAL_TRIM_DEFAULT, preview_dir, process_raw_file as process_pipeline_raw,
 };
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::execute;
@@ -99,8 +98,8 @@ impl App {
             write_preview: false,
             preview_mode: PreviewMode::DebugOverlay,
             final_crop_scale_pct: 0.0,
-            horizontal_trim: clamp_xmp_trim(XMP_HORIZONTAL_TRIM_DEFAULT),
-            vertical_trim: clamp_xmp_trim(XMP_VERTICAL_TRIM_DEFAULT),
+            horizontal_trim: clamp_trim(HORIZONTAL_TRIM_DEFAULT),
+            vertical_trim: clamp_trim(VERTICAL_TRIM_DEFAULT),
             screen: Screen::Select,
             file_cursor: 0,
             progress_done: 0,
@@ -368,11 +367,11 @@ fn draw_select(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, app: &Ap
         ]),
         Line::from(vec![
             Span::styled("[,]/[.] ", key_style()),
-            Span::raw(format!("H +/-{:.4}", XMP_TRIM_STEP)),
+            Span::raw(format!("H +/-{:.4}", TRIM_STEP)),
         ]),
         Line::from(vec![
             Span::styled("[;]/['] ", key_style()),
-            Span::raw(format!("V +/-{:.4}", XMP_TRIM_STEP)),
+            Span::raw(format!("V +/-{:.4}", TRIM_STEP)),
         ]),
         Line::from(Span::styled(
             "Positive trim shrinks crop inward.",
@@ -616,33 +615,27 @@ fn handle_select_key(app: &mut App, args: &Args, code: KeyCode) -> Result<bool> 
             app.select_notice = None;
         }
         KeyCode::Char('[') | KeyCode::Char('-') => {
-            app.final_crop_scale_pct = adjust_final_crop_scale_pct(
-                app.final_crop_scale_pct,
-                -FINAL_CROP_SCALE_FINE_STEP_PCT,
-            );
+            app.final_crop_scale_pct = clamp_scale_pct(app.final_crop_scale_pct - SCALE_FINE_STEP_PCT);
             app.select_notice = None;
         }
         KeyCode::Char(']') | KeyCode::Char('=') => {
-            app.final_crop_scale_pct = adjust_final_crop_scale_pct(
-                app.final_crop_scale_pct,
-                FINAL_CROP_SCALE_FINE_STEP_PCT,
-            );
+            app.final_crop_scale_pct = clamp_scale_pct(app.final_crop_scale_pct + SCALE_FINE_STEP_PCT);
             app.select_notice = None;
         }
         KeyCode::Char(',') => {
-            app.horizontal_trim = adjust_xmp_trim(app.horizontal_trim, -XMP_TRIM_STEP);
+            app.horizontal_trim = clamp_trim(app.horizontal_trim - TRIM_STEP);
             app.select_notice = None;
         }
         KeyCode::Char('.') => {
-            app.horizontal_trim = adjust_xmp_trim(app.horizontal_trim, XMP_TRIM_STEP);
+            app.horizontal_trim = clamp_trim(app.horizontal_trim + TRIM_STEP);
             app.select_notice = None;
         }
         KeyCode::Char(';') => {
-            app.vertical_trim = adjust_xmp_trim(app.vertical_trim, -XMP_TRIM_STEP);
+            app.vertical_trim = clamp_trim(app.vertical_trim - TRIM_STEP);
             app.select_notice = None;
         }
         KeyCode::Char('\'') => {
-            app.vertical_trim = adjust_xmp_trim(app.vertical_trim, XMP_TRIM_STEP);
+            app.vertical_trim = clamp_trim(app.vertical_trim + TRIM_STEP);
             app.select_notice = None;
         }
         KeyCode::Char('0') => {
@@ -650,8 +643,8 @@ fn handle_select_key(app: &mut App, args: &Args, code: KeyCode) -> Result<bool> 
             app.select_notice = None;
         }
         KeyCode::Char('9') => {
-            app.horizontal_trim = clamp_xmp_trim(XMP_HORIZONTAL_TRIM_DEFAULT);
-            app.vertical_trim = clamp_xmp_trim(XMP_VERTICAL_TRIM_DEFAULT);
+            app.horizontal_trim = clamp_trim(HORIZONTAL_TRIM_DEFAULT);
+            app.vertical_trim = clamp_trim(VERTICAL_TRIM_DEFAULT);
             app.select_notice = None;
         }
         KeyCode::Char(' ') => {
@@ -798,7 +791,7 @@ fn process_raw_file(
         }
         Err(e) => {
             let message = e.to_string();
-            if is_cancelled_message(&message) {
+            if message == CANCELLED_MARKER {
                 out = canceled_result();
             } else {
                 out.error = Some(message);
