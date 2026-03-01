@@ -4,7 +4,7 @@ use std::time::Instant;
 use clap::{Parser, ValueEnum};
 use croppy::detect::{BoundsNorm, detect_bounds};
 use croppy::detect_refine::{RotationRefineConfig, run_detection_with_rotation_refine};
-use croppy::preprocess::{PreprocessConfig, prepare_image, resize_rgb_max_edge};
+use croppy::preprocess::{PreprocessConfig, prepare_image, resize_gray_max_edge, resize_rgb_max_edge};
 use image::{GrayImage, Luma, RgbImage};
 use imageproc::drawing::draw_filled_rect_mut;
 use imageproc::geometric_transformations::{Interpolation, rotate_about_center};
@@ -70,8 +70,8 @@ fn preprocess_cfg() -> PreprocessConfig {
 }
 
 fn prepare_for_detection(decoded_rgb: &RgbImage, max_edge: u32) -> GrayImage {
-    let resized = resize_rgb_max_edge(decoded_rgb, max_edge);
-    let gray = image::imageops::grayscale(&resized);
+    let gray = image::imageops::grayscale(decoded_rgb);
+    let gray = resize_gray_max_edge(gray, max_edge);
     prepare_image(gray, preprocess_cfg())
 }
 

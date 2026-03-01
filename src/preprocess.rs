@@ -63,6 +63,25 @@ pub fn resize_rgb_max_edge_owned(img: RgbImage, max_edge: u32) -> RgbImage {
     image::imageops::resize(&img, new_w, new_h, FilterType::Triangle)
 }
 
+pub fn resize_gray_max_edge(img: GrayImage, max_edge: u32) -> GrayImage {
+    if max_edge == 0 {
+        return img;
+    }
+    let (w, h) = img.dimensions();
+    let long = w.max(h);
+    if long <= max_edge {
+        return img;
+    }
+    let near_target_ceiling = ((max_edge as f32) * (1.0 + RESIZE_SKIP_REL_TOLERANCE)).ceil() as u32;
+    if long <= near_target_ceiling {
+        return img;
+    }
+    let scale = max_edge as f32 / long as f32;
+    let new_w = ((w as f32 * scale).round() as u32).max(1);
+    let new_h = ((h as f32 * scale).round() as u32).max(1);
+    image::imageops::resize(&img, new_w, new_h, FilterType::Triangle)
+}
+
 fn stretch_levels(gray: GrayImage, black_pct: f32, white_pct: f32, knee_pct: f32) -> GrayImage {
     let raw = gray.as_raw();
     if raw.is_empty() {
