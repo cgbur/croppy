@@ -194,4 +194,3 @@ fn sample_band_bounds(w: u32, h: u32) -> (u32, u32, u32, u32) {
     let x1 = ((w as f32) * (1.0 - m)).round() as u32;
     (y0, y1, x0, x1)
 }
-

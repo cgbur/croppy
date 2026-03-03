@@ -232,8 +232,7 @@ fn write_preview(
                 || h_trim.abs() > f32::EPSILON
                 || v_trim.abs() > f32::EPSILON;
             if has_adjustments {
-                let (final_inner, theta_opt) =
-                    adjusted_bounds(refine, scale_pct, h_trim, v_trim);
+                let (final_inner, theta_opt) = adjusted_bounds(refine, scale_pct, h_trim, v_trim);
                 if let Some(theta) = theta_opt {
                     draw_refined_inner_backproject(
                         &mut overlay,
