@@ -2,9 +2,13 @@
 
 Croppy is a Rust TUI tool that batch-generates Lightroom crop sidecars for scanned film negatives.
 
+![Croppy TUI and detection preview](assets/demo.png)
+
+*Left: file selection and run options. Right: preview overlay showing detected crop boundaries — yellow is the initial detection, cyan is the rotation-aligned refinement, and green is the final crop that gets written to the XMP sidecar and applied in Lightroom.*
+
 ## Why this exists
 
-After scanning negatives (for example with holders like the VALOI easy35 or a custom camera scanning setup), frames are often slightly off-center, skewed, or inconsistent.  
+After scanning negatives (for example with holders like the VALOI easy35 or a custom camera scanning setup), frames are often slightly off-center, skewed, or inconsistent.
 Manually fixing crop on every frame in Lightroom before running Negative Lab Pro is slow.
 
 Croppy is meant to remove most of that manual first-pass crop work.
@@ -31,7 +35,7 @@ Croppy does **not** modify, delete, or rewrite your RAW files.
 
 ### Option 1: Download a prebuilt release (recommended)
 
-1. Open the latest release page: `https://github.com/cgbur/croppy/releases/latest`
+1. Open the [latest release page](https://github.com/cgbur/croppy/releases/latest).
 2. Download the asset for your platform:
 - Linux x86_64: `croppy-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz`
 - macOS (Apple Silicon): `croppy-vX.Y.Z-aarch64-apple-darwin.tar.gz`
@@ -56,6 +60,14 @@ export PATH="$HOME/.local/bin:$PATH"
 
 ### Option 2: Build from source
 
+Requires `libclang` (needed by `rsraw-sys` for LibRaw bindings). On Debian/Ubuntu:
+
+```bash
+sudo apt install libclang-dev
+```
+
+Then build:
+
 ```bash
 cargo build --release
 ```
@@ -66,25 +78,13 @@ Binary path:
 target/release/croppy
 ```
 
-### TODO: one-line installer
-
-A curl-only `install.sh` that auto-detects OS/arch and installs the latest release is planned, but not shipped yet.
-
 ## Run
-
-Basic run (after install):
 
 ```bash
 croppy /path/to/raw/folder
 ```
 
-If you built from source but did not install into `PATH`:
-
-```bash
-./target/release/croppy /path/to/raw/folder
-```
-
-Useful options:
+Run `croppy --help` for all options. Key flags:
 
 - `--max-edge <N>` downscale long edge before detection (default `1000`)
 - `--out-dir <PATH>` where preview output folder is created (default current directory)
@@ -154,6 +154,10 @@ That default vertical trim is a small inward bias that often helps remove a litt
 - Write Lightroom crop metadata (`CropLeft`, `CropTop`, `CropRight`, `CropBottom`, `CropAngle`) to XMP sidecars.
 
 No machine learning, no OpenCV, minimal dependencies.
+
+## License
+
+[MIT](LICENSE)
 
 ## Contributing
 
