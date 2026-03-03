@@ -153,8 +153,6 @@ That default vertical trim is a small inward bias that often helps remove a litt
 - Attempts one deterministic rotation-refine pass from fitted edge lines, and only applies it when the estimate is valid/plausible.
 - Write Lightroom crop metadata (`CropLeft`, `CropTop`, `CropRight`, `CropBottom`, `CropAngle`) to XMP sidecars.
 
-No machine learning, no OpenCV, minimal dependencies.
-
 ## License
 
 [MIT](LICENSE)
