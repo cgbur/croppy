@@ -615,11 +615,13 @@ fn handle_select_key(app: &mut App, args: &Args, code: KeyCode) -> Result<bool> 
             app.select_notice = None;
         }
         KeyCode::Char('[') | KeyCode::Char('-') => {
-            app.final_crop_scale_pct = clamp_scale_pct(app.final_crop_scale_pct - SCALE_FINE_STEP_PCT);
+            app.final_crop_scale_pct =
+                clamp_scale_pct(app.final_crop_scale_pct - SCALE_FINE_STEP_PCT);
             app.select_notice = None;
         }
         KeyCode::Char(']') | KeyCode::Char('=') => {
-            app.final_crop_scale_pct = clamp_scale_pct(app.final_crop_scale_pct + SCALE_FINE_STEP_PCT);
+            app.final_crop_scale_pct =
+                clamp_scale_pct(app.final_crop_scale_pct + SCALE_FINE_STEP_PCT);
             app.select_notice = None;
         }
         KeyCode::Char(',') => {

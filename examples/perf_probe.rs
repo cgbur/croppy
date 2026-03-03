@@ -4,7 +4,9 @@ use std::time::Instant;
 use clap::{Parser, ValueEnum};
 use croppy::detect::{BoundsNorm, detect_bounds};
 use croppy::detect_refine::{RotationRefineConfig, run_detection_with_rotation_refine};
-use croppy::preprocess::{PreprocessConfig, prepare_image, resize_gray_max_edge, resize_rgb_max_edge};
+use croppy::preprocess::{
+    PreprocessConfig, prepare_image, resize_gray_max_edge, resize_rgb_max_edge,
+};
 use image::{GrayImage, Luma, RgbImage};
 use imageproc::drawing::draw_filled_rect_mut;
 use imageproc::geometric_transformations::{Interpolation, rotate_about_center};
