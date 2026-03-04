@@ -145,6 +145,10 @@ That default vertical trim is a small inward bias that often helps remove a litt
 - Crops are currently free-form and not constrained to a fixed `3:2` aspect ratio.
 - You should still do a quick manual review pass.
 
+![Example of an incorrect crop on a high-contrast B&W scan](assets/failed-crop.jpg)
+
+*An example where the crop aspect ratio is clearly wrong. The detection is doing basic signal processing and doesn't try to constrain to a particular aspect ratio. That said — although the crop boundaries aren't correct, it still accurately selects the region of interest within the frame. Negative Lab Pro will happily do a good conversion from this selection; you'll just need to fix the crop manually afterwards.*
+
 ## How it works (high level)
 
 - RAW decode with `libraw` bindings (`rsraw`/`rsraw-sys`).
