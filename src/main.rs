@@ -29,7 +29,7 @@ use rayon::ThreadPoolBuilder;
 use rayon::prelude::*;
 
 #[derive(Parser, Debug)]
-#[command(about = "Croppy TUI batch runner")]
+#[command(about = "Croppy TUI batch runner", version)]
 struct Args {
     #[arg(default_value = ".")]
     input: PathBuf,
