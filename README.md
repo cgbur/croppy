@@ -1,17 +1,16 @@
 # Croppy
 
-Croppy is a Rust TUI tool that batch-generates Lightroom crop sidecars for scanned film negatives.
+Automatic frame detection and crop sidecar generation for scanned film negatives.
 
 ![Croppy TUI and detection preview](assets/demo.png)
 
-*Left: file selection and run options. Right: preview overlay showing detected crop boundaries — yellow is the initial detection, cyan is the rotation-aligned refinement, and green is the final crop that gets written to the XMP sidecar and applied in Lightroom.*
+*Left: file selection and run options. Right: preview overlay showing detected crop boundaries. Yellow is the initial detection, cyan is the rotation-aligned refinement, and green is the final crop written to the XMP sidecar.*
 
 ## Why this exists
 
-After scanning negatives (for example with holders like the VALOI easy35 or a custom camera scanning setup), frames are often slightly off-center, skewed, or inconsistent.
-Manually fixing crop on every frame in Lightroom before running Negative Lab Pro is slow.
+After scanning negatives (with holders like the VALOI easy35 or a custom camera scanning setup), frames are often slightly off-center, skewed, or inconsistent. Manually fixing the crop on every frame in Lightroom before running Negative Lab Pro is slow.
 
-Croppy is meant to remove most of that manual first-pass crop work.
+Croppy removes most of that manual first-pass crop work. For a deeper writeup on the motivation and how the detection works, see the [blog post](https://cgbur.com/blog/croppy).
 
 ## What it does
 
@@ -147,15 +146,17 @@ That default vertical trim is a small inward bias that often helps remove a litt
 
 ![Example of an incorrect crop on a high-contrast B&W scan](assets/failed-crop.jpg)
 
-*An example where the crop aspect ratio is clearly wrong. The detection is doing basic signal processing and doesn't try to constrain to a particular aspect ratio. That said — although the crop boundaries aren't correct, it still accurately selects the region of interest within the frame. Negative Lab Pro will happily do a good conversion from this selection; you'll just need to fix the crop manually afterwards.*
+*An example where the crop aspect ratio is clearly wrong. The detection doesn't try to constrain to a particular aspect ratio. That said, even though the crop boundaries aren't correct, it still accurately selects the region of interest within the frame. Negative Lab Pro will do a good conversion from this selection; you'll just need to fix the crop manually afterwards.*
 
-## How it works (high level)
+## How it works
 
-- RAW decode with `libraw` bindings (`rsraw`/`rsraw-sys`).
-- Preprocess to improve edge contrast (grayscale, invert, levels, 180-degree normalization).
-- Detect frame bounds from image profiles/edge scans.
-- Attempts one deterministic rotation-refine pass from fitted edge lines, and only applies it when the estimate is valid/plausible.
-- Write Lightroom crop metadata (`CropLeft`, `CropTop`, `CropRight`, `CropBottom`, `CropAngle`) to XMP sidecars.
+1. **Decode** the RAW file, preferring the embedded JPEG preview for speed.
+2. **Preprocess** to grayscale, invert, level-stretch, and optionally flip 180 degrees.
+3. **Detect** frame boundaries by building 1D brightness profiles, taking their derivatives, and finding the first strong peak from each side.
+4. **Refine rotation** by fitting lines to edge points and applying a skew correction (capped at 3 degrees).
+5. **Write** Lightroom crop metadata (`CropLeft`, `CropTop`, `CropRight`, `CropBottom`, `CropAngle`) to XMP sidecars.
+
+For the full technical details, see the [blog post](https://cgbur.com/blog/croppy).
 
 ## License
 
