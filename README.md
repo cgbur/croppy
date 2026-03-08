@@ -41,7 +41,7 @@ Croppy does **not** modify, delete, or rewrite your RAW files.
 3. Extract the archive.
 4. Move the binary into a directory on your `PATH`.
 
-Windows release assets are temporarily disabled while `rsraw`/`rsraw-sys` Windows builds are being resolved.
+**Windows:** Native Windows builds are not currently supported because [LibRaw](https://www.libraw.org/), the underlying RAW decoding library, does not build on Windows. If you're on a Windows machine, use [WSL (Windows Subsystem for Linux)](https://learn.microsoft.com/en-us/windows/wsl/install) and run Croppy from there. This works well and is what I do on my own Windows desktop.
 
 Linux / macOS example:
 
